@@ -826,3 +826,66 @@ async function init() {
 }
 
 init();
+
+// -----------------------------------------------------------------------------
+// Notification preferences — fetch on load, POST on toggle, optimistic update
+// with rollback on failure.
+// -----------------------------------------------------------------------------
+(function initNotifications() {
+  const waterEl = document.getElementById('toggle-water-alerts');
+  const occEl = document.getElementById('toggle-occupancy');
+  const statusEl = document.getElementById('notif-status');
+  if (!waterEl || !occEl || !statusEl) return;
+
+  let statusTimer = null;
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg || '';
+    statusEl.classList.toggle('error', !!isError);
+    if (statusTimer) {
+      clearTimeout(statusTimer);
+      statusTimer = null;
+    }
+    if (msg && !isError) {
+      statusTimer = setTimeout(() => {
+        if (statusEl.textContent === msg) statusEl.textContent = '';
+      }, 2000);
+    }
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/api/settings');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      waterEl.checked = !!data.notify_water_alerts;
+      occEl.checked = !!data.notify_occupancy;
+    } catch (e) {
+      setStatus('Could not load settings', true);
+    }
+  }
+
+  async function save(field, value, sourceEl) {
+    setStatus('Saving…', false);
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [field]: value }),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      // Reflect authoritative server state (handles concurrent edits).
+      waterEl.checked = !!data.notify_water_alerts;
+      occEl.checked = !!data.notify_occupancy;
+      setStatus('Saved', false);
+    } catch (e) {
+      sourceEl.checked = !value; // roll back optimistic UI
+      setStatus('Failed to save — try again', true);
+    }
+  }
+
+  waterEl.addEventListener('change', () => save('notify_water_alerts', waterEl.checked, waterEl));
+  occEl.addEventListener('change', () => save('notify_occupancy', occEl.checked, occEl));
+
+  load();
+})();

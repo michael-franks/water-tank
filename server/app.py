@@ -152,6 +152,32 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS occupancy_state (
+            device_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            last_change_ts TEXT NOT NULL
+        )
+        """
+    )
+    # Seed default notification preferences (INSERT OR IGNORE preserves any
+    # existing values across restarts).
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for key, default in (("notify_water_alerts", "false"), ("notify_occupancy", "true")):
+        cur.execute(
+            "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, default, now_iso),
+        )
     conn.commit()
     # Add fw_version column if missing (existing DBs)
     try:
@@ -242,9 +268,157 @@ def set_alert_state(
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Notification preferences + occupancy state machine
+# ---------------------------------------------------------------------------
+
+def get_setting(key: str, default: str = "") -> str:
+    """Read a persisted setting value (returns default if missing)."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    """Upsert a setting value."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _water_alerts_enabled() -> bool:
+    """Threshold, rapid-change, and sensor-error alerts."""
+    return get_setting("notify_water_alerts") == "true"
+
+
+def _occupancy_alerts_enabled() -> bool:
+    """Bach occupied / unoccupied alerts (replaces the old stale-readings email)."""
+    return get_setting("notify_occupancy") == "true"
+
+
+def get_occupancy_state(conn: sqlite3.Connection, device_id: str):
+    """Return (state, last_change_ts) where state ∈ {'occupied','unoccupied','unknown'}."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT state, last_change_ts FROM occupancy_state WHERE device_id = ?",
+        (device_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return ("unknown", None)
+    last = datetime.fromisoformat(row["last_change_ts"].replace("Z", "+00:00"))
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (row["state"], last)
+
+
+def set_occupancy_state(
+    conn: sqlite3.Connection, device_id: str, state: str, ts: datetime
+) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO occupancy_state (device_id, state, last_change_ts) VALUES (?, ?, ?)
+        ON CONFLICT(device_id) DO UPDATE
+        SET state = excluded.state, last_change_ts = excluded.last_change_ts
+        """,
+        (device_id, state, ts.isoformat()),
+    )
+    conn.commit()
+
+
+def _format_duration(td: timedelta) -> str:
+    total_h = td.total_seconds() / 3600.0
+    if total_h < 24:
+        return f"{total_h:.1f} hours"
+    return f"{total_h / 24:.1f} days"
+
+
+def handle_reading_arrival(conn: sqlite3.Connection, device_id: str, ts: datetime) -> None:
+    """A new reading just landed. Transition occupancy state if needed.
+
+    - unknown → occupied (silent — first reading ever, no email).
+    - unoccupied → occupied (sends 'Bach occupied' email if enabled).
+    - occupied → occupied (no-op).
+    """
+    state, last_change = get_occupancy_state(conn, device_id)
+    if state == "occupied":
+        return
+    set_occupancy_state(conn, device_id, "occupied", ts)
+    if state == "unknown":
+        return  # First-ever reading; no alert.
+    if _occupancy_alerts_enabled():
+        duration_note = ""
+        if last_change is not None:
+            duration_note = f" after {_format_duration(ts - last_change)} offline"
+        send_email(
+            "Bach occupied",
+            f"Water tank circuit came back online at {ts.isoformat()}{duration_note}. "
+            "Someone has likely arrived at the bach.",
+        )
+
+
+def check_occupancy_unoccupied() -> None:
+    """Periodic check. If readings have gone stale AND we still think the bach is
+    occupied, transition to 'unoccupied' and (if enabled) send an alert."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT ts FROM readings WHERE device_id = ? ORDER BY ts DESC LIMIT 1",
+        (DEFAULT_DEVICE_ID,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return  # No readings at all — nothing to compare against.
+    last_ts = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    age_h = (now - last_ts).total_seconds() / 3600.0
+    if age_h < STALE_READING_HOURS:
+        conn.close()
+        return
+    state, _ = get_occupancy_state(conn, DEFAULT_DEVICE_ID)
+    if state != "occupied":
+        conn.close()
+        return
+    set_occupancy_state(conn, DEFAULT_DEVICE_ID, "unoccupied", now)
+    conn.close()
+    if _occupancy_alerts_enabled():
+        send_email(
+            "Bach unoccupied",
+            f"No reading received from the water tank in over {STALE_READING_HOURS:.0f} hours. "
+            f"Last reading was {age_h:.1f} hours ago. The bach is likely unoccupied "
+            "(the circuit is typically turned off when the last visitors depart).",
+        )
+
+
+def _occupancy_check_loop() -> None:
+    while True:
+        time.sleep(STALE_CHECK_INTERVAL_MINUTES * 60)
+        try:
+            check_occupancy_unoccupied()
+        except Exception:
+            pass  # keep the thread alive
+
+
 def maybe_trigger_threshold(
     conn: sqlite3.Connection, device_id: str, level_percent: float, threshold: float
 ) -> None:
+    if not _water_alerts_enabled():
+        return
     alert_type = f"threshold_{int(threshold)}"
     ensure_alert_state(conn, device_id, alert_type)
     cur = conn.cursor()
@@ -265,10 +439,12 @@ def maybe_trigger_threshold(
 
 
 def maybe_trigger_rapid_change(
-    conn: sqlite3.Connection, device_id: str, ts: datetime, level_percent: float, 
+    conn: sqlite3.Connection, device_id: str, ts: datetime, level_percent: float,
     threshold_pct: float, hours: int, alert_type: str, alert_name: str
 ) -> None:
     """Generic rapid change detection."""
+    if not _water_alerts_enabled():
+        return
     ensure_alert_state(conn, device_id, alert_type)
     window_start = (ts - timedelta(hours=hours)).isoformat()
     cur = conn.cursor()
@@ -310,6 +486,8 @@ def maybe_trigger_sensor_error(
     conn: sqlite3.Connection, device_id: str, ts: datetime, distance_cm: float
 ) -> None:
     """Alert if sensor reading < 12cm (indicates condensation or sensor error)."""
+    if not _water_alerts_enabled():
+        return
     alert_type = "sensor_error_condensation"
     ensure_alert_state(conn, device_id, alert_type)
     cur = conn.cursor()
@@ -335,63 +513,6 @@ def maybe_trigger_sensor_error(
         set_alert_state(conn, device_id, alert_type, 1, None)
 
 
-def check_stale_readings() -> None:
-    """Send email/SMS if no reading received from device in STALE_READING_HOURS."""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT ts FROM readings WHERE device_id = ? ORDER BY ts DESC LIMIT 1",
-        (DEFAULT_DEVICE_ID,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    now = datetime.now(timezone.utc)
-    if row is None:
-        # No readings at all - don't alert on first deploy, only after we've had data
-        return
-    last_ts = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
-    if last_ts.tzinfo is None:
-        last_ts = last_ts.replace(tzinfo=timezone.utc)
-    age = (now - last_ts).total_seconds() / 3600.0
-    if age < STALE_READING_HOURS:
-        return
-    conn = get_db()
-    ensure_alert_state(conn, DEFAULT_DEVICE_ID, "stale_reading")
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT armed FROM alert_state WHERE device_id = ? AND alert_type = ?",
-        (DEFAULT_DEVICE_ID, "stale_reading"),
-    )
-    r = cur.fetchone()
-    armed = r["armed"] if r else 1
-    if armed != 1:
-        conn.close()
-        return
-    message = (
-        f"No reading received from device '{DEFAULT_DEVICE_ID}' in over {STALE_READING_HOURS:.0f} hours. "
-        f"Last update was {age:.1f} hours ago. Check device power and cellular connection."
-    )
-    send_sms(message)
-    send_email("Water tank: no recent data", message)
-    set_alert_state(conn, DEFAULT_DEVICE_ID, "stale_reading", 0, now.isoformat())
-    conn.close()
-
-
-def rearm_stale_alert(conn: sqlite3.Connection, device_id: str) -> None:
-    """Re-arm stale-reading alert when a new reading is received."""
-    ensure_alert_state(conn, device_id, "stale_reading")
-    set_alert_state(conn, device_id, "stale_reading", 1, None)
-
-
-def _stale_check_loop() -> None:
-    while True:
-        time.sleep(STALE_CHECK_INTERVAL_MINUTES * 60)
-        try:
-            check_stale_readings()
-        except Exception:
-            pass  # Log and continue; avoid killing the thread
-
-
 app = FastAPI(title="Water Tank Monitor")
 
 if WEB_DIR.exists():
@@ -409,7 +530,7 @@ async def disable_static_cache(request, call_next):
 @app.on_event("startup")
 def startup() -> None:
     init_db()
-    thread = threading.Thread(target=_stale_check_loop, daemon=True)
+    thread = threading.Thread(target=_occupancy_check_loop, daemon=True)
     thread.start()
 
 
@@ -470,7 +591,7 @@ def create_reading(reading: ReadingIn) -> dict:
         maybe_trigger_rapid_change(conn, reading.device_id, ts, level_percent, 10.0, 6, "rapid_change_10pct_6h", "Rapid change alert")
         maybe_trigger_rapid_change(conn, reading.device_id, ts, level_percent, 15.0, 24, "rapid_change_15pct_24h", "Slow leak alert")
 
-    rearm_stale_alert(conn, reading.device_id)
+    handle_reading_arrival(conn, reading.device_id, ts)
     conn.close()
     return {"status": "ok"}
 
@@ -839,6 +960,30 @@ def get_usage_analysis(
     if analysis is None:
         return {"error": "Insufficient data"}
     return analysis
+
+
+class SettingsIn(BaseModel):
+    notify_water_alerts: Optional[bool] = None
+    notify_occupancy: Optional[bool] = None
+
+
+@app.get("/api/settings")
+def read_settings() -> dict:
+    """Current notification preferences."""
+    return {
+        "notify_water_alerts": _water_alerts_enabled(),
+        "notify_occupancy": _occupancy_alerts_enabled(),
+    }
+
+
+@app.post("/api/settings")
+def write_settings(s: SettingsIn) -> dict:
+    """Update one or both notification toggles."""
+    if s.notify_water_alerts is not None:
+        set_setting("notify_water_alerts", "true" if s.notify_water_alerts else "false")
+    if s.notify_occupancy is not None:
+        set_setting("notify_occupancy", "true" if s.notify_occupancy else "false")
+    return read_settings()
 
 
 @app.post("/api/test-email")

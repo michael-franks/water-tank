@@ -63,6 +63,28 @@
         <p id="feedin-legend" class="feedin-legend muted" style="display: none;">🔴= sensor error (condensation)</p>
       </section>
 
+      <section class="notifications" id="notifications-section">
+        <h2>Notifications</h2>
+        <p class="muted notifications-subtitle">Email alerts. Water alerts are off by default while the sensor is noisy; occupancy alerts are on.</p>
+        <div class="notif-toggles">
+          <label class="notif-toggle">
+            <input type="checkbox" id="toggle-water-alerts" />
+            <span class="notif-toggle-label">
+              <strong>Water level &amp; sensor alerts</strong>
+              <span class="notif-toggle-sub muted">Threshold alerts (50/25/10%), rapid-change/leak detection, sensor-error alerts</span>
+            </span>
+          </label>
+          <label class="notif-toggle">
+            <input type="checkbox" id="toggle-occupancy" />
+            <span class="notif-toggle-label">
+              <strong>Bach occupied / unoccupied</strong>
+              <span class="notif-toggle-sub muted">Email when readings go silent for &gt;6h (departure) or resume after a gap (arrival)</span>
+            </span>
+          </label>
+        </div>
+        <p class="notif-status" id="notif-status" aria-live="polite"></p>
+      </section>
+
       <section class="footer-row">
         <div class="last-update footer-update">
           <div class="last-update-header">

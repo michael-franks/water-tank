@@ -67,6 +67,76 @@ header {
   box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
 }
 
+/* Notifications card */
+.notifications {
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 20px;
+  margin: 16px 0 24px;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+}
+
+.notifications h2 {
+  margin: 0 0 4px 0;
+}
+
+.notifications-subtitle {
+  margin: 0 0 16px 0;
+  font-size: 14px;
+}
+
+.notif-toggles {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.notif-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 10px;
+  background: #f8fafc;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.15s ease;
+}
+
+.notif-toggle:hover {
+  background: #f1f5f9;
+}
+
+.notif-toggle input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  cursor: pointer;
+  accent-color: #0ea5e9;
+  flex-shrink: 0;
+}
+
+.notif-toggle-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.notif-toggle-sub {
+  font-size: 13px;
+}
+
+.notif-status {
+  font-size: 13px;
+  margin: 12px 0 0 0;
+  min-height: 18px;
+  color: #64748b;
+}
+
+.notif-status.error {
+  color: #b91c1c;
+}
+
 .footer-row {
   display: flex;
   justify-content: space-between;
