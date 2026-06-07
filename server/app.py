@@ -6,8 +6,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+try:
+    from zoneinfo import ZoneInfo
+    NZ_TZ = ZoneInfo("Pacific/Auckland")
+except ImportError:
+    NZ_TZ = timezone(timedelta(hours=12))  # fallback, no DST
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -170,6 +176,22 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS occupancy_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            from_state TEXT NOT NULL,
+            to_state TEXT NOT NULL,
+            ts TEXT NOT NULL
+        )
+        """
+    )
+    # Hot-path index for the dominant query shape:
+    # SELECT ... FROM readings WHERE device_id = ? AND ts ... ORDER BY ts DESC
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_readings_device_ts ON readings(device_id, ts DESC)"
+    )
     # Seed default notification preferences (INSERT OR IGNORE preserves any
     # existing values across restarts).
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -178,6 +200,11 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
             (key, default, now_iso),
         )
+    # Drop alert_state rows for alert types that no longer exist in the code
+    # (cleanup after the notification refactor).
+    cur.execute(
+        "DELETE FROM alert_state WHERE alert_type IN ('stale_reading', 'rapid_change_5pct_24h')"
+    )
     conn.commit()
     # Add fw_version column if missing (existing DBs)
     try:
@@ -307,6 +334,19 @@ def _occupancy_alerts_enabled() -> bool:
     return get_setting("notify_occupancy") == "true"
 
 
+def _reject_ingest_host(request: Request) -> None:
+    """Block admin endpoints when accessed via the public unauthenticated ingest hostname.
+
+    The dashboard (bach.franks.nz) sits behind Cloudflare Access; the ingest hostname
+    (ingest-bach.franks.nz) is unauthenticated so the sensor can POST. Both resolve to
+    the same FastAPI app, so we keep admin endpoints (notification toggles, test email)
+    off the ingest hostname.
+    """
+    host = (request.headers.get("host") or "").lower()
+    if host.startswith("ingest-bach."):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
 def get_occupancy_state(conn: sqlite3.Connection, device_id: str):
     """Return (state, last_change_ts) where state ∈ {'occupied','unoccupied','unknown'}."""
     cur = conn.cursor()
@@ -338,11 +378,41 @@ def set_occupancy_state(
     conn.commit()
 
 
-def _format_duration(td: timedelta) -> str:
-    total_h = td.total_seconds() / 3600.0
-    if total_h < 24:
-        return f"{total_h:.1f} hours"
-    return f"{total_h / 24:.1f} days"
+def format_duration_human(td: timedelta) -> str:
+    """Match the JS formatTimeAgo phrasing (minus 'ago'): integer minute/hour/day units."""
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 60:
+        return "less than a minute"
+    minutes = total_seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'' if minutes == 1 else 's'}"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hour{'' if hours == 1 else 's'}"
+    days = hours // 24
+    return f"{days} day{'' if days == 1 else 's'}"
+
+
+def format_local_time(ts: datetime) -> str:
+    """Render a UTC datetime as a human-readable NZ local string for emails."""
+    nz = ts.astimezone(NZ_TZ)
+    # %I/%M/%p give zero-padded 12-hour time, fine cross-platform.
+    return nz.strftime("%A %d %B %Y at %I:%M %p NZT")
+
+
+def log_occupancy_transition(
+    conn: sqlite3.Connection, device_id: str, from_state: str, to_state: str, ts: datetime
+) -> None:
+    """Append a row to occupancy_transitions so we can render a visit history later."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO occupancy_transitions (device_id, from_state, to_state, ts)
+        VALUES (?, ?, ?, ?)
+        """,
+        (device_id, from_state, to_state, ts.isoformat()),
+    )
+    conn.commit()
 
 
 def handle_reading_arrival(conn: sqlite3.Connection, device_id: str, ts: datetime) -> None:
@@ -356,16 +426,17 @@ def handle_reading_arrival(conn: sqlite3.Connection, device_id: str, ts: datetim
     if state == "occupied":
         return
     set_occupancy_state(conn, device_id, "occupied", ts)
+    log_occupancy_transition(conn, device_id, state, "occupied", ts)
     if state == "unknown":
         return  # First-ever reading; no alert.
     if _occupancy_alerts_enabled():
         duration_note = ""
         if last_change is not None:
-            duration_note = f" after {_format_duration(ts - last_change)} offline"
+            duration_note = f" after {format_duration_human(ts - last_change)} offline"
         send_email(
             "Bach occupied",
-            f"Water tank circuit came back online at {ts.isoformat()}{duration_note}. "
-            "Someone has likely arrived at the bach.",
+            f"Water tank circuit came back online on {format_local_time(ts)}"
+            f"{duration_note}. Someone has likely arrived at the bach.",
         )
 
 
@@ -395,12 +466,14 @@ def check_occupancy_unoccupied() -> None:
         conn.close()
         return
     set_occupancy_state(conn, DEFAULT_DEVICE_ID, "unoccupied", now)
+    log_occupancy_transition(conn, DEFAULT_DEVICE_ID, "occupied", "unoccupied", now)
     conn.close()
     if _occupancy_alerts_enabled():
         send_email(
             "Bach unoccupied",
             f"No reading received from the water tank in over {STALE_READING_HOURS:.0f} hours. "
-            f"Last reading was {age_h:.1f} hours ago. The bach is likely unoccupied "
+            f"Last reading was {format_duration_human(now - last_ts)} ago "
+            f"(at {format_local_time(last_ts)}). The bach is likely unoccupied "
             "(the circuit is typically turned off when the last visitors depart).",
         )
 
@@ -643,22 +716,50 @@ def latest_reading(device_id: str = Query(default=DEFAULT_DEVICE_ID)) -> dict:
 def list_readings(
     device_id: str = Query(default=DEFAULT_DEVICE_ID),
     limit: int = Query(default=10080, ge=1, le=20000),
+    since: Optional[str] = Query(default=None, description="ISO timestamp; return readings at or after this time."),
+    until: Optional[str] = Query(default=None, description="ISO timestamp; return readings at or before this time."),
 ) -> dict:
+    """Returns readings ordered oldest→newest, filtered by optional time window."""
+    where = ["device_id = ?"]
+    params: list = [device_id]
+    if since is not None:
+        try:
+            datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid 'since' timestamp") from exc
+        where.append("ts >= ?")
+        params.append(since)
+    if until is not None:
+        try:
+            datetime.fromisoformat(until.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid 'until' timestamp") from exc
+        where.append("ts <= ?")
+        params.append(until)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT * FROM readings
-        WHERE device_id = ?
-        ORDER BY ts DESC
-        LIMIT ?
-        """,
-        (device_id, limit),
-    )
+    sql = f"SELECT * FROM readings WHERE {' AND '.join(where)} ORDER BY ts DESC LIMIT ?"
+    params.append(limit)
+    cur.execute(sql, params)
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     rows.reverse()
     return {"readings": rows}
+
+
+@app.get("/api/config")
+def get_public_config() -> dict:
+    """Shared constants the dashboard needs; lets the client stay in sync with
+    server-side calibration without duplicating literals."""
+    return {
+        "tank_capacity_liters": TANK_CAPACITY_LITERS,
+        "tank_depth_cm": TANK_DEPTH_CM,
+        "sensor_to_water_full_cm": SENSOR_TO_WATER_FULL_CM,
+        "sensor_to_bottom_cm": SENSOR_TO_BOTTOM_CM,
+        "condensation_error_cm": CONDENSATION_ERROR_CM,
+        "stale_reading_hours": STALE_READING_HOURS,
+        "default_device_id": DEFAULT_DEVICE_ID,
+    }
 
 
 def calculate_feedin_flowrate(conn: sqlite3.Connection, device_id: str, days: int = 7) -> Optional[float]:
@@ -672,15 +773,7 @@ def calculate_feedin_flowrate(conn: sqlite3.Connection, device_id: str, days: in
     Returns:
         Average flow rate in L/hour, or None if insufficient data
     """
-    # NZ timezone (handles DST automatically)
-    try:
-        from zoneinfo import ZoneInfo
-        nz_tz = ZoneInfo("Pacific/Auckland")
-    except ImportError:
-        # Fallback for older Python versions - use UTC offset (NZ is UTC+12/+13)
-        # For simplicity, use UTC+12 (will be slightly off during DST)
-        nz_tz = timezone(timedelta(hours=12))
-    
+    nz_tz = NZ_TZ
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     cur = conn.cursor()
     cur.execute(
@@ -736,14 +829,7 @@ def get_daily_feedin_rates(conn: sqlite3.Connection, device_id: str, days: int =
     Returns:
         List of dicts with keys: date (YYYY-MM-DD), flowrate_lph, level_start, level_end
     """
-    # NZ timezone (handles DST automatically)
-    try:
-        from zoneinfo import ZoneInfo
-        nz_tz = ZoneInfo("Pacific/Auckland")
-    except ImportError:
-        # Fallback for older Python versions - use UTC offset (NZ is UTC+12/+13)
-        nz_tz = timezone(timedelta(hours=12))
-    
+    nz_tz = NZ_TZ
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     cur = conn.cursor()
     cur.execute(
@@ -870,14 +956,8 @@ def calculate_net_usage_analysis(conn: sqlite3.Connection, device_id: str, days:
     for date, rate_lph in feedin_by_date.items():
         daily_feedin_volumes[date] = rate_lph * 24.0
     
-    # Calculate level changes per day to estimate usage
-    # Group readings by day (NZ time)
-    try:
-        from zoneinfo import ZoneInfo
-        nz_tz = ZoneInfo("Pacific/Auckland")
-    except ImportError:
-        nz_tz = timezone(timedelta(hours=12))
-    
+    # Calculate level changes per day to estimate usage. Group by NZ-time date.
+    nz_tz = NZ_TZ
     daily_levels = {}  # date -> list of (ts, level_percent)
     for row in rows:
         ts_utc = datetime.fromisoformat(row["ts"])
@@ -983,8 +1063,9 @@ def read_settings() -> dict:
 
 
 @app.post("/api/settings")
-def write_settings(s: SettingsIn) -> dict:
+def write_settings(s: SettingsIn, request: Request) -> dict:
     """Update one or both notification toggles."""
+    _reject_ingest_host(request)
     if s.notify_water_alerts is not None:
         set_setting("notify_water_alerts", "true" if s.notify_water_alerts else "false")
     if s.notify_occupancy is not None:
@@ -993,8 +1074,9 @@ def write_settings(s: SettingsIn) -> dict:
 
 
 @app.post("/api/test-email")
-def test_email() -> dict:
+def test_email(request: Request) -> dict:
     """Send a test email to verify SMTP configuration."""
+    _reject_ingest_host(request)
     try:
         send_email(
             "Water Tank Monitor - Test Email",
