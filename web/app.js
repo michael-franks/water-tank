@@ -277,6 +277,12 @@ const historyLevelFillPlugin = {
     const yScale = chart.scales.yPercent;
     const y0 = yScale.getPixelForValue(0);
     const ctx = chart.ctx;
+    const ca = chart.chartArea;
+    // Clip to the chart plot area so fills don't leak into axis label space.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ca.left, ca.top, ca.right - ca.left, ca.bottom - ca.top);
+    ctx.clip();
     for (let i = 0; i < meta.data.length - 1; i++) {
       const p0 = meta.data[i];
       const p1 = meta.data[i + 1];
@@ -284,7 +290,6 @@ const historyLevelFillPlugin = {
       const raw1 = data[i + 1];
       const isError =
         (raw0 && raw0.condensation_error) || (raw1 && raw1.condensation_error);
-      ctx.save();
       ctx.beginPath();
       ctx.moveTo(p0.x, p0.y);
       ctx.lineTo(p1.x, p1.y);
@@ -293,8 +298,8 @@ const historyLevelFillPlugin = {
       ctx.closePath();
       ctx.fillStyle = isError ? "rgba(220, 38, 38, 0.25)" : "rgba(79, 70, 229, 0.25)";
       ctx.fill();
-      ctx.restore();
     }
+    ctx.restore();
   },
 };
 if (typeof Chart !== "undefined") Chart.register(historyLevelFillPlugin);

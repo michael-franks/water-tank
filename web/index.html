@@ -23,6 +23,19 @@
             <div class="hero-sub"><span class="badge" id="hero-days">—</span></div>
           </div>
         </div>
+        <div class="hero-notif-strip">
+          <label class="notif-slider">
+            <input type="checkbox" id="toggle-water-alerts" />
+            <span class="slider-track"></span>
+            <span class="notif-slider-label">Water alerts</span>
+          </label>
+          <label class="notif-slider">
+            <input type="checkbox" id="toggle-occupancy" />
+            <span class="slider-track"></span>
+            <span class="notif-slider-label">Occupancy alerts</span>
+          </label>
+          <span class="notif-status" id="notif-status" aria-live="polite"></span>
+        </div>
       </section>
 
       <section class="chart-section">
@@ -61,28 +74,6 @@
         <p class="feedin-rate-subtitle">Average feed-in rate (measured from 2-7am)</p>
         <canvas id="feedinChart"></canvas>
         <p id="feedin-legend" class="feedin-legend muted" style="display: none;">🔴= sensor error (condensation)</p>
-      </section>
-
-      <section class="notifications" id="notifications-section">
-        <h2>Notifications</h2>
-        <p class="muted notifications-subtitle">Email alerts. Water alerts are off by default while the sensor is noisy; occupancy alerts are on.</p>
-        <div class="notif-toggles">
-          <label class="notif-toggle">
-            <input type="checkbox" id="toggle-water-alerts" />
-            <span class="notif-toggle-label">
-              <strong>Water level &amp; sensor alerts</strong>
-              <span class="notif-toggle-sub muted">Threshold alerts (50/25/10%), rapid-change/leak detection, sensor-error alerts</span>
-            </span>
-          </label>
-          <label class="notif-toggle">
-            <input type="checkbox" id="toggle-occupancy" />
-            <span class="notif-toggle-label">
-              <strong>Bach occupied / unoccupied</strong>
-              <span class="notif-toggle-sub muted">Email when readings go silent for &gt;6h (departure) or resume after a gap (arrival)</span>
-            </span>
-          </label>
-        </div>
-        <p class="notif-status" id="notif-status" aria-live="polite"></p>
       </section>
 
       <section class="footer-row">
