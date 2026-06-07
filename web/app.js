@@ -1,21 +1,37 @@
 const lastUpdateEl = document.getElementById("last-update");
 const lastUpdateMetaEl = document.getElementById("last-update-meta");
-const lastUpdateAgoEl = document.getElementById("last-update-ago");
-const levelDistanceEl = document.getElementById("level-distance");
 const signalDetailsEl = document.getElementById("signal-details");
-const feedinRateEl = document.getElementById("feedin-rate");
 const fwVersionEl = document.getElementById("fw-version");
 const heroLevelEl = document.getElementById("hero-level");
 const heroLitersEl = document.getElementById("hero-liters");
 const heroDaysEl = document.getElementById("hero-days");
 const heroSensorEl = document.getElementById("hero-sensor");
 const heroOccupancyEl = document.getElementById("hero-occupancy");
-const levelStatusEl = document.getElementById("level-status");
 const signalBadgeEl = document.getElementById("signal-badge");
 
-const DAILY_USAGE_LITERS = 390;
-const TANK_CAPACITY_LITERS = 30000;
 const REFRESH_INTERVAL_MS = 60 * 1000;
+
+// Populated from GET /api/config on init; defaults keep the dashboard usable
+// if that fetch fails. Keep keys aligned with server's get_public_config().
+let serverConfig = {
+  tank_capacity_liters: 30000,
+  tank_depth_cm: 250,
+  sensor_to_water_full_cm: 17,
+  sensor_to_bottom_cm: 267,
+  condensation_error_cm: 13,
+  stale_reading_hours: 6,
+};
+
+async function fetchConfig() {
+  try {
+    const r = await fetch("/api/config");
+    if (!r.ok) return;
+    const data = await r.json();
+    serverConfig = { ...serverConfig, ...data };
+  } catch (err) {
+    // Keep defaults.
+  }
+}
 
 let historyChart = null;
 let feedinChart = null;
@@ -57,8 +73,13 @@ async function fetchUsageAnalysis() {
   }
 }
 
-async function fetchReadings(limit = 10080) {
-  const response = await fetch(`/api/readings?limit=${limit}`);
+async function fetchReadings(since = null, limit = 10080) {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  if (since != null) {
+    params.set("since", new Date(since).toISOString());
+  }
+  const response = await fetch(`/api/readings?${params}`);
   const payload = await response.json();
   return payload.readings || [];
 }
@@ -139,13 +160,15 @@ function formatSignal(value, unit) {
   return `${value} ${unit}`;
 }
 
-function estimateDaysRemainingFromLatest(reading) {
+// Fallback estimator only used if /api/usage-analysis returns insufficient-data.
+// The server's analysis is the source of truth when available.
+function estimateDaysRemainingFromLatest(reading, fallbackDailyLiters = 390) {
   if (!reading || reading.level_percent === null || reading.level_percent === undefined) {
     return null;
   }
-  const litersRemaining = (reading.level_percent / 100) * TANK_CAPACITY_LITERS;
+  const litersRemaining = (reading.level_percent / 100) * serverConfig.tank_capacity_liters;
   if (litersRemaining <= 0) return 0;
-  return litersRemaining / DAILY_USAGE_LITERS;
+  return litersRemaining / fallbackDailyLiters;
 }
 
 function toSignalQuality(rsrp) {
@@ -208,7 +231,6 @@ function renderLatest(payload) {
   if (!reading) {
     lastUpdateEl.textContent = "—";
     lastUpdateMetaEl.textContent = "—";
-    if (lastUpdateAgoEl) lastUpdateAgoEl.textContent = "—";
     heroLevelEl.textContent = "—";
     heroLitersEl.textContent = "—";
     heroDaysEl.textContent = "—";
@@ -216,7 +238,6 @@ function renderLatest(payload) {
       heroSensorEl.textContent = "—";
       heroSensorEl.className = "hero-sensor";
     }
-    levelStatusEl.textContent = "—";
     return;
   }
   const sensorError = payload.sensor_error === true;
@@ -228,8 +249,6 @@ function renderLatest(payload) {
   lastUpdateMetaEl.textContent = `Distance: ${formatDistance(reading.distance_cm)} · Level: ${formatPercent(
     reading.level_percent
   )}`;
-  if (lastUpdateAgoEl) lastUpdateAgoEl.textContent = "";
-  if (levelDistanceEl) levelDistanceEl.textContent = `Sensor reading: ${formatDistance(reading.distance_cm)}`;
   signalDetailsEl.textContent = `RSRP: ${formatSignal(reading.signal_rsrp, "dBm")}`;
   fwVersionEl.textContent = reading.fw_version != null && reading.fw_version !== ""
     ? `Firmware: v${reading.fw_version}`
@@ -245,16 +264,11 @@ function renderLatest(payload) {
     heroLitersEl.textContent = "";
     heroDaysEl.textContent = "";
   } else {
-    const litersRemaining = (displayReading.level_percent / 100) * TANK_CAPACITY_LITERS;
+    const litersRemaining = (displayReading.level_percent / 100) * serverConfig.tank_capacity_liters;
     heroLitersEl.textContent = `≈ ${Math.round(litersRemaining).toLocaleString()} L remaining`;
     heroDaysEl.textContent = ""; // Will be updated by updateDashboard with usage analysis
   }
 
-  if (levelStatusEl) {
-    const status = getLevelStatus(displayReading.level_percent);
-    levelStatusEl.textContent = status.text;
-    levelStatusEl.className = status.className;
-  }
   if (signalBadgeEl) {
     const signal = getSignalBadge(reading.signal_rsrp);
     signalBadgeEl.textContent = `Signal: ${signal.text}`;
@@ -288,7 +302,6 @@ function renderLatest(payload) {
   }
 }
 
-const CONDENSATION_ERROR_CM = 13;
 
 const historyLevelFillPlugin = {
   id: "historyLevelFill",
@@ -331,12 +344,12 @@ function renderChart(readings) {
   const dataPercent = readings.map((r) => ({
     x: new Date(r.ts).getTime(),
     y: r.level_percent,
-    condensation_error: r.distance_cm != null && r.distance_cm < CONDENSATION_ERROR_CM,
+    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
   }));
   const dataDistance = readings.map((r) => ({
     x: new Date(r.ts).getTime(),
     y: r.distance_cm,
-    condensation_error: r.distance_cm != null && r.distance_cm < CONDENSATION_ERROR_CM,
+    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
   }));
 
   const ctx = document.getElementById("historyChart").getContext("2d");
@@ -424,6 +437,9 @@ function renderChart(readings) {
         yDistance: {
           type: "linear",
           position: "right",
+          min: 0,
+          // Just past SENSOR_TO_BOTTOM_CM (267) so the empty tank fits.
+          max: 300,
           title: { display: true, text: "Distance (cm)" },
           grid: { drawOnChartArea: false },
         },
@@ -436,12 +452,12 @@ function updateChart(chart, readings) {
   const dataPercent = readings.map((r) => ({
     x: new Date(r.ts).getTime(),
     y: r.level_percent,
-    condensation_error: r.distance_cm != null && r.distance_cm < CONDENSATION_ERROR_CM,
+    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
   }));
   const dataDistance = readings.map((r) => ({
     x: new Date(r.ts).getTime(),
     y: r.distance_cm,
-    condensation_error: r.distance_cm != null && r.distance_cm < CONDENSATION_ERROR_CM,
+    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
   }));
   const window = getRangeWindow(currentRange);
   const timeUnit = getTimeUnit(window);
@@ -732,7 +748,7 @@ function updateDaysRemaining(reading, usageAnalysis) {
     return;
   }
 
-  const litersRemaining = (reading.level_percent / 100) * TANK_CAPACITY_LITERS;
+  const litersRemaining = (reading.level_percent / 100) * serverConfig.tank_capacity_liters;
 
   if (usageAnalysis && usageAnalysis.net_usage_lpd !== undefined) {
     const netUsage = usageAnalysis.net_usage_lpd;
@@ -764,9 +780,14 @@ function updateDaysRemaining(reading, usageAnalysis) {
 }
 
 async function updateDashboard() {
+  // Pass since= so /api/readings returns only what the chart needs, instead of
+  // dragging ALL readings every minute. 'All time' (window=null) falls through
+  // to the server's limit cap.
+  const window = getRangeWindow(currentRange);
+  const since = window ? window.min : null;
   const [latest, readings, feedinRate, dailyRates, usageAnalysis] = await Promise.all([
     fetchLatest(),
-    fetchReadings(),
+    fetchReadings(since),
     fetchFeedinRate(),
     fetchDailyFeedinRates(),
     fetchUsageAnalysis(),
@@ -779,15 +800,8 @@ async function updateDashboard() {
         ? null
         : latest.reading;
   updateDaysRemaining(displayReading, usageAnalysis);
-  if (feedinRateEl) {
-    if (feedinRate !== null && feedinRate !== undefined) {
-      feedinRateEl.textContent = `${feedinRate.toFixed(1)} L/hour (2am–7am avg, applied 24h)`;
-    } else {
-      feedinRateEl.textContent = "Insufficient data";
-    }
-  }
   const hasHistoryError = readings.some(
-    (r) => r.distance_cm != null && r.distance_cm < CONDENSATION_ERROR_CM
+    (r) => r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm
   );
   const hasFeedinError = (dailyRates || []).some((r) => r.condensation_error);
   const historyLegendEl = document.getElementById("history-legend");
@@ -848,7 +862,9 @@ async function init() {
       applyCustomRange();
     }
   });
-  
+
+  // Fetch server config first so charts + level math use authoritative constants.
+  await fetchConfig();
   await updateDashboard();
   setInterval(updateDashboard, REFRESH_INTERVAL_MS);
 }
