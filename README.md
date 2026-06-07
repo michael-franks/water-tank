@@ -20,7 +20,9 @@ with the custom Meter Carrier hat (OSHO Ltd PN 01014-A3).
 | `server/THIN-COMMANDS.md` | How to use the thinning script. |
 | `web/index.html` + `web/app.js` + `web/style.css` | Single-page dashboard. Charts via Chart.js. |
 | `firmware/` | nRF9160 DK Zephyr app. Flashed separately (not part of the deploy pipeline). |
-| `PROJECT_SUMMARY.md`, `REPLICATION_GUIDE.md`, `EMAIL_SETUP.md`, `DEMO_PRESENTATION.md` | Project context + setup notes. |
+| `tests/` | Unit tests for the server-side math + occupancy state machine. Run with `python -m unittest discover tests`. Not deployed. |
+| `hooks/` | Canonical copy of the Proxmox post-receive deploy hook + an `install.sh` to set it up on a fresh host. Not deployed. |
+| `REPLICATION_GUIDE.md`, `EMAIL_SETUP.md`, `DEMO_PRESENTATION.md` | Setup notes and demo material. |
 
 Secrets and data are never committed (`.gitignore`): `server/.env`,
 `server/data/*.db*`.
@@ -58,6 +60,9 @@ pip install -r server/requirements.txt
 cp server/env.example server/.env       # fill in SMTP if you want email
 python server/app.py                    # serves on :8000
 
+# Tests
+python -m unittest discover tests       # runs the unit suite
+
 # Deploy: push to both remotes.
 # A post-receive hook on the Proxmox host parse-checks server/app.py, backs up
 # the live copy, promotes server/ + web/ into LXC 104, restarts the service
@@ -68,6 +73,10 @@ git push origin main     # history + offsite backup (GitHub)
 git push deploy main     # deploy to bach.franks.nz (LXC 104)
 # one-time: git remote add deploy proxmox-claude:/root/water-tank-monitor.git
 ```
+
+If the bare repo on the Proxmox host needs to be rebuilt (host wipe, accidental
+delete), see `hooks/README.md` — it documents the install pattern (SCP the hook
+to /tmp, run `hooks/install.sh` over SSH).
 
 ### Conventions
 - **Commit and push every change** — small, focused commits on `main`.
@@ -94,9 +103,9 @@ never in git. Two layers protect it:
 
 1. **`server/data/readings.db.bak`** — sibling backup file on the LXC, taken
    when the thinning script was last run.
-2. **Weekly Proxmox vzdump** of LXC 100 (HAOS) only — LXC 104 is **not**
-   currently in the backup set. Worth adding `vmid 104` to the vzdump job
-   (`backup-75d85498-ebc0`) if continuity matters.
+2. **Weekly Proxmox vzdump** of LXC 100 (HAOS) **and LXC 104** — job
+   `backup-75d85498-ebc0`, Sundays 01:00, storage `backups`, `keep-last=2`,
+   compression zstd, mode snapshot.
 
 The post-receive deploy hook keeps `server/data/` and `server/.env` untouched
 across deploys (they get stashed/restored), and a `.deploybak/code.tar.gz`

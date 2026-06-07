@@ -1,0 +1,103 @@
+#!/bin/sh
+# post-receive: deploy Water Tank Monitor to LXC 104 on push to main.
+# Validates Python BEFORE promoting, restarts only if server/ changed,
+# health-checks, auto-rolls-back on failure.
+
+GD=/root/water-tank-monitor.git
+WORK=/root/water-tank-deploy-work
+CTID=104
+DEST=/root/water-tank-monitor
+VENV_PY=/root/water-tank-monitor/.venv/bin/python
+
+while read oldrev newrev ref; do
+  [ "$ref" = "refs/heads/main" ] || { echo "[deploy] ignoring $ref"; continue; }
+
+  rm -rf "$WORK"; mkdir -p "$WORK"
+  git --git-dir="$GD" --work-tree="$WORK" checkout -f main
+
+  short=$(echo "$newrev" | cut -c1-7)
+  echo "[deploy] deploying $short to LXC $CTID"
+
+  # 1) Parse-check Python files BEFORE touching live
+  for f in server/app.py server/thin_readings_to_30min.py; do
+    [ -f "$WORK/$f" ] || continue
+    pct push $CTID "$WORK/$f" /tmp/dep-check.py
+    if ! pct exec $CTID -- $VENV_PY -m py_compile /tmp/dep-check.py 2>/dev/null; then
+      echo "[deploy] ABORT: $f failed parse-check - live unchanged"
+      pct exec $CTID -- rm -f /tmp/dep-check.py
+      exit 1
+    fi
+  done
+  pct exec $CTID -- rm -f /tmp/dep-check.py
+
+  # 2) What changed?
+  case "$oldrev" in
+    0000000000000000000000000000000000000000) changed="server/initial web/initial" ;;
+    *) changed=$(git --git-dir="$GD" diff --name-only "$oldrev" "$newrev") ;;
+  esac
+
+  # 3) Backup current code (excluding data/ and .env)
+  pct exec $CTID -- sh -c "
+    rm -rf $DEST/.deploybak
+    mkdir -p $DEST/.deploybak
+    tar -C $DEST -czf $DEST/.deploybak/code.tar.gz \
+        --exclude='server/data' --exclude='server/data/*' --exclude='server/.env' \
+        server web 2>/dev/null || true
+  "
+
+  # 4) Build deploy tarball locally and push
+  ( cd "$WORK" && tar --exclude='server/data' --exclude='server/data/*' --exclude='server/.env' \
+                      -czf /tmp/wt-deploy.tar.gz server web )
+  pct push $CTID /tmp/wt-deploy.tar.gz /tmp/wt-deploy.tar.gz
+  rm -f /tmp/wt-deploy.tar.gz
+
+  # 5) Promote: stash data/ + .env, replace code, restore stash
+  pct exec $CTID -- sh -ec "
+    STASH=/tmp/wt-stash
+    rm -rf \$STASH && mkdir -p \$STASH
+    if [ -e $DEST/server/data ]; then mv $DEST/server/data \$STASH/data; fi
+    if [ -e $DEST/server/.env ]; then mv $DEST/server/.env \$STASH/.env; fi
+    rm -rf $DEST/server $DEST/web
+    tar -xzf /tmp/wt-deploy.tar.gz -C $DEST
+    rm -f /tmp/wt-deploy.tar.gz
+    mkdir -p $DEST/server
+    if [ -e \$STASH/data ]; then mv \$STASH/data $DEST/server/data; fi
+    if [ -e \$STASH/.env ]; then mv \$STASH/.env $DEST/server/.env; fi
+    rmdir \$STASH 2>/dev/null || true
+  "
+
+  # 6) Restart service if server/ files changed
+  restart=0
+  echo "$changed" | grep -q "^server/" && restart=1
+  if [ "$restart" = "1" ]; then
+    echo "[deploy] server/ changed - restarting water-tank.service"
+    pct exec $CTID -- systemctl restart water-tank
+    sleep 3
+  fi
+
+  # 7) Health check (use venv Python since LXC has no curl)
+  if pct exec $CTID -- $VENV_PY -c "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0 if r.status==200 else 1)" 2>/dev/null; then
+    if [ "$restart" = "1" ]; then
+      echo "[deploy] OK - /health 200 - deployed (service restarted)"
+    else
+      echo "[deploy] OK - /health 200 - deployed (web files hot-swapped)"
+    fi
+  else
+    echo "[deploy] FAIL - /health unreachable or non-200 - rolling back"
+    pct exec $CTID -- sh -ec "
+      STASH=/tmp/wt-stash
+      rm -rf \$STASH && mkdir -p \$STASH
+      if [ -e $DEST/server/data ]; then mv $DEST/server/data \$STASH/data; fi
+      if [ -e $DEST/server/.env ]; then mv $DEST/server/.env \$STASH/.env; fi
+      rm -rf $DEST/server $DEST/web
+      tar -xzf $DEST/.deploybak/code.tar.gz -C $DEST
+      mkdir -p $DEST/server
+      if [ -e \$STASH/data ]; then mv \$STASH/data $DEST/server/data; fi
+      if [ -e \$STASH/.env ]; then mv \$STASH/.env $DEST/server/.env; fi
+      rmdir \$STASH 2>/dev/null || true
+    "
+    [ "$restart" = "1" ] && pct exec $CTID -- systemctl restart water-tank
+    echo "[deploy] rolled back to previous version"
+    exit 1
+  fi
+done
