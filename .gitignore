@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets
+.env
+server/.env
+
+# SQLite data — lives only on the LXC, never in git
+server/data/*.db
+server/data/*.db-*
+server/data/*.db.bak
+server/data/*.sqlite
+server/data/*.sqlite-*
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Build artefacts (firmware — built locally, flashed separately)
+firmware/build/
+firmware/.west/
+
+# Deploy backups created by the post-receive hook (in case any leak locally)
+*.deploybak
+.deploybak/
+
+# Logs
+*.log

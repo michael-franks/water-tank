@@ -1,0 +1,862 @@
+import os
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+try:
+    from twilio.rest import Client as TwilioClient
+except Exception:  # pragma: no cover - optional dependency at runtime
+    TwilioClient = None
+
+
+BASE_DIR = Path(__file__).resolve().parent
+WEB_DIR = BASE_DIR.parent / "web"
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+load_dotenv(BASE_DIR / ".env")
+
+DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "readings.db"))
+DEFAULT_DEVICE_ID = os.getenv("DEFAULT_DEVICE_ID", "tank-1")
+ALERT_HYSTERESIS_PCT = float(os.getenv("ALERT_HYSTERESIS_PCT", "2.0"))
+INGEST_API_KEY = os.getenv("INGEST_API_KEY", "").strip()
+STALE_READING_HOURS = float(os.getenv("STALE_READING_HOURS", "6.0"))
+STALE_CHECK_INTERVAL_MINUTES = int(os.getenv("STALE_CHECK_INTERVAL_MINUTES", "30"))
+
+# Tank calibration: 170mm from sensor to water when full, 2500mm tank depth
+SENSOR_TO_WATER_FULL_CM = 17.0
+TANK_DEPTH_CM = 250.0
+SENSOR_TO_BOTTOM_CM = SENSOR_TO_WATER_FULL_CM + TANK_DEPTH_CM
+TANK_CAPACITY_LITERS = float(os.getenv("TANK_CAPACITY_LITERS", "30000"))
+
+# Feed-in flow rate: ignore windows shorter than this (noisy rate from 2 nearby readings)
+MIN_FEEDIN_WINDOW_HOURS = 0.25
+# Distance reading below this is treated as condensation/sensor error (cm)
+CONDENSATION_ERROR_CM = 13.0
+
+
+def _feedin_avg_rate_from_readings(readings: list) -> Optional[tuple]:
+    """From 2am-7am readings (ts, level_percent), compute flow rate (L/h) for each consecutive
+    pair, then return the average of those rates. If level reaches 100%, only use readings
+    up to that point. Returns (avg_rate_lph, first_level, last_level, reached_100) or None.
+    """
+    if len(readings) < 2:
+        return None
+    readings = sorted(readings, key=lambda x: x[0])
+    # If tank hits 100% during the window, ignore readings after that point
+    reached_100 = False
+    for i, (_, level) in enumerate(readings):
+        if level >= 99.5:
+            readings = readings[: i + 1]
+            reached_100 = True
+            break
+    if len(readings) < 2:
+        if reached_100:
+            return (0.0, readings[0][1], readings[-1][1], True)
+        return None
+    rates = []
+    for i in range(len(readings) - 1):
+        ts_a, level_a = readings[i]
+        ts_b, level_b = readings[i + 1]
+        dt_hours = (ts_b - ts_a).total_seconds() / 3600.0
+        if dt_hours <= 0:
+            continue
+        volume_change_l = ((level_b - level_a) / 100.0) * TANK_CAPACITY_LITERS
+        rate_lph = volume_change_l / dt_hours
+        rates.append(rate_lph)
+    first_level = readings[0][1]
+    last_level = readings[-1][1]
+    if not rates:
+        return (0.0, first_level, last_level, reached_100) if reached_100 else None
+    total_span_hours = (readings[-1][0] - readings[0][0]).total_seconds() / 3600.0
+    if total_span_hours < MIN_FEEDIN_WINDOW_HOURS and not reached_100:
+        return None
+    if total_span_hours < MIN_FEEDIN_WINDOW_HOURS and reached_100:
+        return (0.0, first_level, last_level, True)
+    avg_rate = sum(rates) / len(rates)
+    if avg_rate < 0:
+        avg_rate = 0.0
+    return (avg_rate, first_level, last_level, reached_100)
+
+ALERT_SMS_TO = os.getenv("ALERT_SMS_TO", "").strip()
+# Comma-separated list of email addresses to receive alerts
+ALERT_EMAIL_TO = [e.strip() for e in os.getenv("ALERT_EMAIL_TO", "").split(",") if e.strip()]
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
+
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip()
+
+
+class ReadingIn(BaseModel):
+    device_id: str = Field(default=DEFAULT_DEVICE_ID, min_length=1)
+    api_key: Optional[str] = Field(default=None, description="Shared secret for device auth.")
+    ts: Optional[str] = Field(
+        default=None,
+        description="ISO-8601 timestamp; if absent, server time is used.",
+    )
+    distance_cm: float = Field(..., gt=0)
+    level_percent: Optional[float] = Field(default=None, ge=0, le=100)
+    signal_rssi: Optional[int] = None
+    signal_rsrp: Optional[int] = None
+    temp_c: Optional[float] = None
+    fw_version: Optional[str] = Field(default=None, description="Firmware version from device.")
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            distance_cm REAL NOT NULL,
+            level_percent REAL,
+            signal_rssi INTEGER,
+            signal_rsrp INTEGER,
+            temp_c REAL,
+            fw_version TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_state (
+            device_id TEXT NOT NULL,
+            alert_type TEXT NOT NULL,
+            armed INTEGER NOT NULL DEFAULT 1,
+            last_triggered_ts TEXT,
+            PRIMARY KEY (device_id, alert_type)
+        )
+        """
+    )
+    conn.commit()
+    # Add fw_version column if missing (existing DBs)
+    try:
+        cur.execute("ALTER TABLE readings ADD COLUMN fw_version TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    conn.close()
+
+
+def calculate_level_percent(distance_cm: float) -> float:
+    """Calculate water level percentage from sensor distance.
+    
+    Args:
+        distance_cm: Distance from sensor to water surface in cm
+        
+    Returns:
+        Level percentage (0-100), clamped to valid range
+    """
+    if distance_cm < SENSOR_TO_WATER_FULL_CM:
+        return 100.0
+    if distance_cm > SENSOR_TO_BOTTOM_CM:
+        return 0.0
+    water_height = SENSOR_TO_BOTTOM_CM - distance_cm
+    percent = (water_height / TANK_DEPTH_CM) * 100.0
+    return max(0.0, min(100.0, percent))
+
+
+def parse_ts(ts: Optional[str]) -> datetime:
+    if ts is None:
+        return datetime.now(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid timestamp format") from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def send_sms(message: str) -> None:
+    if not (ALERT_SMS_TO and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        return
+    if TwilioClient is None:
+        return
+    client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    client.messages.create(to=ALERT_SMS_TO, from_=TWILIO_FROM_NUMBER, body=message)
+
+
+def send_email(subject: str, body: str) -> None:
+    if not (ALERT_EMAIL_TO and SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM):
+        return
+    import smtplib
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = SMTP_FROM
+    msg["To"] = ", ".join(ALERT_EMAIL_TO)
+    msg["Subject"] = subject
+    msg.set_content(body)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg, to_addrs=ALERT_EMAIL_TO)
+
+
+def ensure_alert_state(conn: sqlite3.Connection, device_id: str, alert_type: str) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO alert_state (device_id, alert_type, armed) VALUES (?, ?, 1)",
+        (device_id, alert_type),
+    )
+    conn.commit()
+
+
+def set_alert_state(
+    conn: sqlite3.Connection, device_id: str, alert_type: str, armed: int, ts: Optional[str]
+) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE alert_state
+        SET armed = ?, last_triggered_ts = ?
+        WHERE device_id = ? AND alert_type = ?
+        """,
+        (armed, ts, device_id, alert_type),
+    )
+    conn.commit()
+
+
+def maybe_trigger_threshold(
+    conn: sqlite3.Connection, device_id: str, level_percent: float, threshold: float
+) -> None:
+    alert_type = f"threshold_{int(threshold)}"
+    ensure_alert_state(conn, device_id, alert_type)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT armed FROM alert_state WHERE device_id = ? AND alert_type = ?",
+        (device_id, alert_type),
+    )
+    row = cur.fetchone()
+    armed = row["armed"] if row else 1
+
+    if level_percent <= threshold and armed == 1:
+        message = f"Water level is below {threshold:.0f}%."
+        send_sms(message)
+        send_email("Water level alert", message)
+        set_alert_state(conn, device_id, alert_type, 0, datetime.now(timezone.utc).isoformat())
+    elif level_percent >= threshold + ALERT_HYSTERESIS_PCT and armed == 0:
+        set_alert_state(conn, device_id, alert_type, 1, None)
+
+
+def maybe_trigger_rapid_change(
+    conn: sqlite3.Connection, device_id: str, ts: datetime, level_percent: float, 
+    threshold_pct: float, hours: int, alert_type: str, alert_name: str
+) -> None:
+    """Generic rapid change detection."""
+    ensure_alert_state(conn, device_id, alert_type)
+    window_start = (ts - timedelta(hours=hours)).isoformat()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT level_percent, ts FROM readings
+        WHERE device_id = ? AND level_percent IS NOT NULL AND ts >= ?
+        ORDER BY ts ASC
+        LIMIT 1
+        """,
+        (device_id, window_start),
+    )
+    baseline = cur.fetchone()
+    if baseline is None:
+        return
+    baseline_pct = float(baseline["level_percent"])
+    # Only alert on decrease (possible leak), not on increase
+    if level_percent >= baseline_pct:
+        return
+    delta = baseline_pct - level_percent
+    if delta < threshold_pct:
+        return
+    cur.execute(
+        "SELECT last_triggered_ts FROM alert_state WHERE device_id = ? AND alert_type = ?",
+        (device_id, alert_type),
+    )
+    state = cur.fetchone()
+    if state and state["last_triggered_ts"]:
+        last_ts = datetime.fromisoformat(state["last_triggered_ts"])
+        if ts - last_ts < timedelta(hours=hours):
+            return
+    message = f"Water level dropped by {threshold_pct:.0f}% or more within {hours} hours."
+    send_sms(message)
+    send_email(alert_name, message)
+    set_alert_state(conn, device_id, alert_type, 1, ts.isoformat())
+
+
+def maybe_trigger_sensor_error(
+    conn: sqlite3.Connection, device_id: str, ts: datetime, distance_cm: float
+) -> None:
+    """Alert if sensor reading < 12cm (indicates condensation or sensor error)."""
+    alert_type = "sensor_error_condensation"
+    ensure_alert_state(conn, device_id, alert_type)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT armed FROM alert_state WHERE device_id = ? AND alert_type = ?",
+        (device_id, alert_type),
+    )
+    row = cur.fetchone()
+    armed = row["armed"] if row else 1
+
+    # Alert if distance < 12cm (sensor error/condensation)
+    if distance_cm < 12.0 and armed == 1:
+        message = (
+            f"Sensor error detected: Reading {distance_cm:.1f}cm is below 12cm threshold. "
+            "This may indicate condensation on the sensor or a sensor malfunction. "
+            "Please check the sensor."
+        )
+        send_sms(message)
+        send_email("Sensor Error Alert", message)
+        set_alert_state(conn, device_id, alert_type, 0, ts.isoformat())
+    # Re-arm if reading returns to normal (>= 12cm)
+    elif distance_cm >= 12.0 and armed == 0:
+        set_alert_state(conn, device_id, alert_type, 1, None)
+
+
+def check_stale_readings() -> None:
+    """Send email/SMS if no reading received from device in STALE_READING_HOURS."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT ts FROM readings WHERE device_id = ? ORDER BY ts DESC LIMIT 1",
+        (DEFAULT_DEVICE_ID,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    now = datetime.now(timezone.utc)
+    if row is None:
+        # No readings at all - don't alert on first deploy, only after we've had data
+        return
+    last_ts = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+    age = (now - last_ts).total_seconds() / 3600.0
+    if age < STALE_READING_HOURS:
+        return
+    conn = get_db()
+    ensure_alert_state(conn, DEFAULT_DEVICE_ID, "stale_reading")
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT armed FROM alert_state WHERE device_id = ? AND alert_type = ?",
+        (DEFAULT_DEVICE_ID, "stale_reading"),
+    )
+    r = cur.fetchone()
+    armed = r["armed"] if r else 1
+    if armed != 1:
+        conn.close()
+        return
+    message = (
+        f"No reading received from device '{DEFAULT_DEVICE_ID}' in over {STALE_READING_HOURS:.0f} hours. "
+        f"Last update was {age:.1f} hours ago. Check device power and cellular connection."
+    )
+    send_sms(message)
+    send_email("Water tank: no recent data", message)
+    set_alert_state(conn, DEFAULT_DEVICE_ID, "stale_reading", 0, now.isoformat())
+    conn.close()
+
+
+def rearm_stale_alert(conn: sqlite3.Connection, device_id: str) -> None:
+    """Re-arm stale-reading alert when a new reading is received."""
+    ensure_alert_state(conn, device_id, "stale_reading")
+    set_alert_state(conn, device_id, "stale_reading", 1, None)
+
+
+def _stale_check_loop() -> None:
+    while True:
+        time.sleep(STALE_CHECK_INTERVAL_MINUTES * 60)
+        try:
+            check_stale_readings()
+        except Exception:
+            pass  # Log and continue; avoid killing the thread
+
+
+app = FastAPI(title="Water Tank Monitor")
+
+if WEB_DIR.exists():
+    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+
+
+@app.middleware("http")
+async def disable_static_cache(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+    thread = threading.Thread(target=_stale_check_loop, daemon=True)
+    thread.start()
+
+
+@app.get("/")
+def index() -> FileResponse:
+    index_path = WEB_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Web UI not found")
+    return FileResponse(index_path)
+
+
+@app.get("/health")
+def health() -> dict:
+    """Liveness probe used by the deploy hook to verify a successful push."""
+    return {"status": "ok"}
+
+
+@app.post("/api/readings")
+def create_reading(reading: ReadingIn) -> dict:
+    if INGEST_API_KEY and reading.api_key != INGEST_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    ts = parse_ts(reading.ts)
+    
+    # Calculate level_percent from distance if not provided
+    level_percent = reading.level_percent
+    if level_percent is None:
+        level_percent = calculate_level_percent(reading.distance_cm)
+    
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO readings
+        (device_id, ts, distance_cm, level_percent, signal_rssi, signal_rsrp, temp_c, fw_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            reading.device_id,
+            ts.isoformat(),
+            reading.distance_cm,
+            level_percent,
+            reading.signal_rssi,
+            reading.signal_rsrp,
+            reading.temp_c,
+            reading.fw_version,
+        ),
+    )
+    conn.commit()
+
+    # Check for sensor errors (condensation/malfunction)
+    maybe_trigger_sensor_error(conn, reading.device_id, ts, reading.distance_cm)
+
+    if level_percent is not None:
+        maybe_trigger_threshold(conn, reading.device_id, level_percent, 50.0)
+        maybe_trigger_threshold(conn, reading.device_id, level_percent, 25.0)
+        maybe_trigger_threshold(conn, reading.device_id, level_percent, 10.0)
+        # Rapid change alerts: 10% in 6 hours (fast leak) and 15% in 24 hours (slow leak)
+        maybe_trigger_rapid_change(conn, reading.device_id, ts, level_percent, 10.0, 6, "rapid_change_10pct_6h", "Rapid change alert")
+        maybe_trigger_rapid_change(conn, reading.device_id, ts, level_percent, 15.0, 24, "rapid_change_15pct_24h", "Slow leak alert")
+
+    rearm_stale_alert(conn, reading.device_id)
+    conn.close()
+    return {"status": "ok"}
+
+
+@app.get("/api/latest")
+def latest_reading(device_id: str = Query(default=DEFAULT_DEVICE_ID)) -> dict:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM readings
+        WHERE device_id = ?
+        ORDER BY ts DESC
+        LIMIT 1
+        """,
+        (device_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return {"reading": None}
+    out = {"reading": dict(row)}
+    dist = row["distance_cm"]
+    if dist is not None and dist < SENSOR_TO_WATER_FULL_CM:
+        out["sensor_error"] = True
+        cur.execute(
+            """
+            SELECT * FROM readings
+            WHERE device_id = ? AND (distance_cm IS NULL OR distance_cm >= ?)
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (device_id, SENSOR_TO_WATER_FULL_CM),
+        )
+        good = cur.fetchone()
+        if good is not None:
+            out["last_good_reading"] = dict(good)
+    conn.close()
+    return out
+
+
+@app.get("/api/readings")
+def list_readings(
+    device_id: str = Query(default=DEFAULT_DEVICE_ID),
+    limit: int = Query(default=10080, ge=1, le=20000),
+) -> dict:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM readings
+        WHERE device_id = ?
+        ORDER BY ts DESC
+        LIMIT ?
+        """,
+        (device_id, limit),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    rows.reverse()
+    return {"readings": rows}
+
+
+def calculate_feedin_flowrate(conn: sqlite3.Connection, device_id: str, days: int = 7) -> Optional[float]:
+    """Calculate average feed-in flow rate (L/hour) from level changes during 2am-7am NZ time.
+    
+    Args:
+        conn: Database connection
+        device_id: Device ID to query
+        days: Number of recent days to analyze
+        
+    Returns:
+        Average flow rate in L/hour, or None if insufficient data
+    """
+    # NZ timezone (handles DST automatically)
+    try:
+        from zoneinfo import ZoneInfo
+        nz_tz = ZoneInfo("Pacific/Auckland")
+    except ImportError:
+        # Fallback for older Python versions - use UTC offset (NZ is UTC+12/+13)
+        # For simplicity, use UTC+12 (will be slightly off during DST)
+        nz_tz = timezone(timedelta(hours=12))
+    
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ts, level_percent FROM readings
+        WHERE device_id = ? AND ts >= ? AND level_percent IS NOT NULL
+        ORDER BY ts ASC
+        """,
+        (device_id, cutoff),
+    )
+    rows = cur.fetchall()
+    if len(rows) < 2:
+        return None
+    
+    # Group readings by day and calculate flow rate for 2am-7am windows (NZ time)
+    daily_flowrates = []
+    day_readings = {}  # date -> list of (ts, level_percent) tuples
+    
+    for row in rows:
+        ts_utc = datetime.fromisoformat(row["ts"])
+        if ts_utc.tzinfo is None:
+            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+        # Convert to NZ time
+        ts_nz = ts_utc.astimezone(nz_tz)
+        hour = ts_nz.hour
+        date_key = ts_nz.date()
+        
+        # Only consider readings between 2am and 7am NZ time
+        if 2 <= hour < 7:
+            if date_key not in day_readings:
+                day_readings[date_key] = []
+            day_readings[date_key].append((ts_utc, float(row["level_percent"])))
+    
+    # Flow rate each day: average of (rate between each consecutive 2am-7am pair)
+    for date_key, readings in day_readings.items():
+        result = _feedin_avg_rate_from_readings(readings)
+        if result is None:
+            daily_flowrates.append(0.0)
+            continue
+        avg_rate, _first, _last, _reached_100 = result
+        daily_flowrates.append(avg_rate)
+    
+    if not daily_flowrates:
+        return None
+    
+    # Return average flow rate across all days (L/h)
+    return sum(daily_flowrates) / len(daily_flowrates)
+
+
+def get_daily_feedin_rates(conn: sqlite3.Connection, device_id: str, days: int = 30) -> list:
+    """Get daily feed-in flow rates (L/hour) for each day with 2am-7am data.
+    
+    Returns:
+        List of dicts with keys: date (YYYY-MM-DD), flowrate_lph, level_start, level_end
+    """
+    # NZ timezone (handles DST automatically)
+    try:
+        from zoneinfo import ZoneInfo
+        nz_tz = ZoneInfo("Pacific/Auckland")
+    except ImportError:
+        # Fallback for older Python versions - use UTC offset (NZ is UTC+12/+13)
+        nz_tz = timezone(timedelta(hours=12))
+    
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ts, level_percent, distance_cm FROM readings
+        WHERE device_id = ? AND ts >= ? AND level_percent IS NOT NULL
+        ORDER BY ts ASC
+        """,
+        (device_id, cutoff),
+    )
+    rows = cur.fetchall()
+    if len(rows) < 2:
+        return []
+
+    # Group readings by day and calculate flow rate for 2am-7am windows (NZ time)
+    daily_data = {}  # date -> {readings: [(ts, level, distance_cm), ...]}
+
+    for row in rows:
+        ts_utc = datetime.fromisoformat(row["ts"])
+        if ts_utc.tzinfo is None:
+            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+        ts_nz = ts_utc.astimezone(nz_tz)
+        hour = ts_nz.hour
+        date_key = ts_nz.date()
+        if 2 <= hour < 7:
+            if date_key not in daily_data:
+                daily_data[date_key] = {"readings": []}
+            dist = row["distance_cm"]
+            daily_data[date_key]["readings"].append(
+                (ts_utc, float(row["level_percent"]), float(dist) if dist is not None else None)
+            )
+    
+    # Flow rate each day: average of rates between each consecutive pair in 2am-7am
+    result = []
+    for date_key in sorted(daily_data.keys()):
+        readings = daily_data[date_key]["readings"]
+        # Condensation error if any reading in this window had distance_cm < threshold
+        condensation_error = any(
+            r[2] is not None and r[2] < CONDENSATION_ERROR_CM for r in readings
+        )
+        readings_ts_level = [(r[0], r[1]) for r in readings]
+        quad = _feedin_avg_rate_from_readings(readings_ts_level)
+        if quad is None:
+            sorted_r = sorted(readings, key=lambda x: x[0])
+            first_l = sorted_r[0][1] if sorted_r else 0.0
+            last_l = sorted_r[-1][1] if sorted_r else 0.0
+            result.append({
+                "date": date_key.isoformat(),
+                "flowrate_lph": 0.0,
+                "level_start": round(first_l, 2),
+                "level_end": round(last_l, 2),
+                "reached_full": False,
+                "condensation_error": condensation_error,
+            })
+            continue
+        avg_rate, first_l, last_l, reached_full = quad
+        result.append({
+            "date": date_key.isoformat(),
+            "flowrate_lph": round(avg_rate, 2),
+            "level_start": round(first_l, 2),
+            "level_end": round(last_l, 2),
+            "reached_full": reached_full,
+            "condensation_error": condensation_error,
+        })
+    
+    return result
+
+
+@app.get("/api/feedin-rate")
+def get_feedin_rate(
+    device_id: str = Query(default=DEFAULT_DEVICE_ID),
+    days: int = Query(default=7, ge=1, le=30),
+) -> dict:
+    """Get average feed-in flow rate calculated from 2am-7am level increases."""
+    conn = get_db()
+    flowrate = calculate_feedin_flowrate(conn, device_id, days)
+    conn.close()
+    if flowrate is None:
+        return {"flowrate_lph": None, "message": "Insufficient data"}
+    return {"flowrate_lph": round(flowrate, 2)}
+
+
+@app.get("/api/feedin-rate/daily")
+def get_daily_feedin_rates_endpoint(
+    device_id: str = Query(default=DEFAULT_DEVICE_ID),
+    days: int = Query(default=30, ge=1, le=90),
+) -> dict:
+    """Get daily feed-in flow rates for each night (2am-7am window)."""
+    conn = get_db()
+    daily_rates = get_daily_feedin_rates(conn, device_id, days)
+    conn.close()
+    return {"daily_rates": daily_rates}
+
+
+def calculate_net_usage_analysis(conn: sqlite3.Connection, device_id: str, days: int = 3) -> Optional[dict]:
+    """Calculate net usage (usage - feed-in) over the past N days.
+    
+    Returns:
+        dict with keys: net_usage_lpd (liters per day), sustainable (bool), 
+        days_until_empty (float or None), avg_daily_usage_lpd, avg_daily_feedin_lpd
+    """
+    # Get recent readings to calculate actual usage
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days + 1)).isoformat()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ts, level_percent FROM readings
+        WHERE device_id = ? AND ts >= ? AND level_percent IS NOT NULL
+        ORDER BY ts ASC
+        """,
+        (device_id, cutoff),
+    )
+    rows = cur.fetchall()
+    if len(rows) < 2:
+        return None
+    
+    # Get daily feed-in rates
+    daily_feedin = get_daily_feedin_rates(conn, device_id, days + 1)
+    feedin_by_date = {r["date"]: r["flowrate_lph"] for r in daily_feedin}
+    
+    # Calculate daily feed-in volume: rate is measured during 2am-7am (low usage);
+    # for a constant spring/seep source we assume the same rate applies 24h.
+    daily_feedin_volumes = {}
+    for date, rate_lph in feedin_by_date.items():
+        daily_feedin_volumes[date] = rate_lph * 24.0
+    
+    # Calculate level changes per day to estimate usage
+    # Group readings by day (NZ time)
+    try:
+        from zoneinfo import ZoneInfo
+        nz_tz = ZoneInfo("Pacific/Auckland")
+    except ImportError:
+        nz_tz = timezone(timedelta(hours=12))
+    
+    daily_levels = {}  # date -> list of (ts, level_percent)
+    for row in rows:
+        ts_utc = datetime.fromisoformat(row["ts"])
+        if ts_utc.tzinfo is None:
+            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+        ts_nz = ts_utc.astimezone(nz_tz)
+        date_key = ts_nz.date()
+        if date_key not in daily_levels:
+            daily_levels[date_key] = []
+        daily_levels[date_key].append((ts_utc, float(row["level_percent"])))
+    
+    # Calculate net usage per day
+    # For each day, calculate: net_usage = usage - feed_in
+    # Where usage = volume_decrease (if level went down)
+    daily_net_usage = []  # liters per day (positive = using more than feed-in)
+    sorted_dates = sorted(daily_levels.keys())
+    
+    for i in range(len(sorted_dates) - 1):
+        date1 = sorted_dates[i]
+        date2 = sorted_dates[i + 1]
+        
+        # Get first reading of day1 and last reading of day2
+        readings1 = sorted(daily_levels[date1], key=lambda x: x[0])
+        readings2 = sorted(daily_levels[date2], key=lambda x: x[0])
+        
+        if len(readings1) == 0 or len(readings2) == 0:
+            continue
+        
+        level_start = readings1[0][1]
+        level_end = readings2[-1][1]
+        
+        # Observed volume change = feed_in - usage (negative when level dropped)
+        volume_change = ((level_end - level_start) / 100.0) * TANK_CAPACITY_LITERS
+        # Net depletion = usage - feed_in = -volume_change (positive when tank is being drawn down)
+        net_usage = -volume_change
+        daily_net_usage.append(net_usage)
+    
+    if len(daily_net_usage) == 0:
+        return None
+    
+    avg_net_usage = sum(daily_net_usage) / len(daily_net_usage)
+    avg_feedin = sum(daily_feedin_volumes.values()) / len(daily_feedin_volumes) if daily_feedin_volumes else 0.0
+    
+    # Average daily consumption: usage = net_usage + feed_in (net_usage = usage - feed_in)
+    avg_usage = avg_net_usage + avg_feedin
+    
+    # Determine sustainability
+    sustainable = avg_net_usage <= 0  # If net usage is negative or zero, feed-in >= usage
+    
+    # Calculate days until empty (need current level)
+    cur.execute(
+        """
+        SELECT level_percent FROM readings
+        WHERE device_id = ? AND level_percent IS NOT NULL
+        ORDER BY ts DESC
+        LIMIT 1
+        """,
+        (device_id,),
+    )
+    latest_row = cur.fetchone()
+    if latest_row and avg_net_usage > 0:
+        current_level = float(latest_row["level_percent"])
+        liters_remaining = (current_level / 100.0) * TANK_CAPACITY_LITERS
+        days_until_empty = liters_remaining / avg_net_usage
+    else:
+        days_until_empty = None
+    
+    return {
+        "net_usage_lpd": round(avg_net_usage, 2),
+        "sustainable": sustainable,
+        "days_until_empty": round(days_until_empty, 1) if days_until_empty else None,
+        "avg_daily_usage_lpd": round(avg_usage, 2),
+        "avg_daily_feedin_lpd": round(avg_feedin, 2),
+    }
+
+
+@app.get("/api/usage-analysis")
+def get_usage_analysis(
+    device_id: str = Query(default=DEFAULT_DEVICE_ID),
+    days: int = Query(default=3, ge=1, le=7),
+) -> dict:
+    """Get net usage analysis (usage - feed-in) for sustainability calculation."""
+    conn = get_db()
+    analysis = calculate_net_usage_analysis(conn, device_id, days)
+    conn.close()
+    if analysis is None:
+        return {"error": "Insufficient data"}
+    return analysis
+
+
+@app.post("/api/test-email")
+def test_email() -> dict:
+    """Send a test email to verify SMTP configuration."""
+    try:
+        send_email(
+            "Water Tank Monitor - Test Email",
+            "This is a test email from the Water Tank Monitor system.\n\n"
+            "If you received this, email alerts are configured correctly!\n\n"
+            f"Test sent at: {datetime.now(timezone.utc).isoformat()}"
+        )
+        return {"status": "ok", "message": "Test email sent successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
