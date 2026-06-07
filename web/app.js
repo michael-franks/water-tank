@@ -9,6 +9,7 @@ const heroLevelEl = document.getElementById("hero-level");
 const heroLitersEl = document.getElementById("hero-liters");
 const heroDaysEl = document.getElementById("hero-days");
 const heroSensorEl = document.getElementById("hero-sensor");
+const heroOccupancyEl = document.getElementById("hero-occupancy");
 const levelStatusEl = document.getElementById("level-status");
 const signalBadgeEl = document.getElementById("signal-badge");
 
@@ -195,6 +196,13 @@ function formatTimeAgo(ts) {
   return "just now";
 }
 
+// "10 hours ago" -> "for 10 hours". Returns "just now" unchanged.
+function formatDurationFor(ts) {
+  const ago = formatTimeAgo(ts);
+  if (ago === "just now") return ago;
+  return "for " + ago.replace(/ ago$/, "");
+}
+
 function renderLatest(payload) {
   const reading = payload.reading;
   if (!reading) {
@@ -255,12 +263,27 @@ function renderLatest(payload) {
   if (heroSensorEl) {
     if (sensorError) {
       heroSensorEl.textContent = payload.last_good_reading
-        ? `❌ error since ${formatTimeAgo(payload.last_good_reading.ts)}`
+        ? `❌ error: ${formatDurationFor(payload.last_good_reading.ts)}`
         : "❌ sensor error";
       heroSensorEl.className = "hero-sensor is-error";
     } else {
       heroSensorEl.textContent = `Sensor updated: ${agoText}`;
       heroSensorEl.className = "hero-sensor";
+    }
+  }
+  if (heroOccupancyEl) {
+    const occ = payload.occupancy;
+    if (!occ || occ.state === "unknown" || !occ.state) {
+      heroOccupancyEl.textContent = "";
+      heroOccupancyEl.className = "hero-occupancy";
+    } else if (occ.state === "occupied") {
+      const since = occ.last_change_ts ? `: ${formatDurationFor(occ.last_change_ts)}` : "";
+      heroOccupancyEl.textContent = `🏠 occupied${since}`;
+      heroOccupancyEl.className = "hero-occupancy is-occupied";
+    } else {
+      const since = occ.last_change_ts ? `: ${formatDurationFor(occ.last_change_ts)}` : "";
+      heroOccupancyEl.textContent = `🏠 unoccupied${since}`;
+      heroOccupancyEl.className = "hero-occupancy is-unoccupied";
     }
   }
 }

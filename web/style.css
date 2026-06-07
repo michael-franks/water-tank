@@ -223,6 +223,24 @@ header {
   font-weight: 600;
 }
 
+.hero-occupancy {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 14px;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+.hero-occupancy.is-occupied {
+  color: #16a34a;
+}
+
+.hero-occupancy.is-unoccupied {
+  color: #64748b;
+}
+
 .hero-badges {
   display: flex;
   gap: 8px;
@@ -399,7 +417,8 @@ header {
     width: 100%;
   }
 
-  .hero-sensor {
+  .hero-sensor,
+  .hero-occupancy {
     justify-content: flex-start;
   }
 

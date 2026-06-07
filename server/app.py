@@ -629,6 +629,12 @@ def latest_reading(device_id: str = Query(default=DEFAULT_DEVICE_ID)) -> dict:
         good = cur.fetchone()
         if good is not None:
             out["last_good_reading"] = dict(good)
+    # Expose occupancy state so the dashboard can render a status line.
+    state, last_change = get_occupancy_state(conn, device_id)
+    out["occupancy"] = {
+        "state": state,
+        "last_change_ts": last_change.isoformat() if last_change else None,
+    }
     conn.close()
     return out
 
