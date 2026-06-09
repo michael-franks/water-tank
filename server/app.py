@@ -38,6 +38,12 @@ INGEST_API_KEY = os.getenv("INGEST_API_KEY", "").strip()
 STALE_READING_HOURS = float(os.getenv("STALE_READING_HOURS", "6.0"))
 STALE_CHECK_INTERVAL_MINUTES = int(os.getenv("STALE_CHECK_INTERVAL_MINUTES", "30"))
 
+# iCal feed for VRBO/Bookabach bookings. Supports http(s):// and file:// URLs.
+# Leave empty to disable booking sync; the bookings table stays empty and the
+# dashboard treats the bach as 'no bookings known'.
+BOOKINGS_ICAL_URL = os.getenv("BOOKINGS_ICAL_URL", "").strip()
+BOOKINGS_SYNC_INTERVAL_MINUTES = int(os.getenv("BOOKINGS_SYNC_INTERVAL_MINUTES", "60"))
+
 # Tank calibration: 170mm from sensor to water when full, 2500mm tank depth
 SENSOR_TO_WATER_FULL_CM = 17.0
 TANK_DEPTH_CM = 250.0
@@ -186,6 +192,21 @@ def init_db() -> None:
             ts TEXT NOT NULL
         )
         """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_uid TEXT NOT NULL UNIQUE,
+            summary TEXT,
+            start_ts TEXT NOT NULL,
+            end_ts TEXT NOT NULL,
+            last_synced TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bookings_range ON bookings(start_ts, end_ts)"
     )
     # Hot-path index for the dominant query shape:
     # SELECT ... FROM readings WHERE device_id = ? AND ts ... ORDER BY ts DESC
@@ -487,6 +508,139 @@ def _occupancy_check_loop() -> None:
             pass  # keep the thread alive
 
 
+# ---------------------------------------------------------------------------
+# Booking sync (VRBO / Bookabach iCal feed)
+# ---------------------------------------------------------------------------
+
+def _parse_ical_dt(line: str) -> Optional[str]:
+    """Parse an iCal DTSTART/DTEND line value into an ISO-8601 UTC string.
+
+    Handles three shapes that VRBO-family feeds emit:
+      DTSTART;VALUE=DATE:20260614          (all-day, interpreted as midnight NZ)
+      DTSTART:20260614T143000Z             (UTC datetime)
+      DTSTART;TZID=Pacific/Auckland:20260614T150000  (local datetime, treated as NZ)
+    Unknown shapes return None and the event is skipped.
+    """
+    head, _, value = line.partition(":")
+    head_upper = head.upper()
+    try:
+        if value.endswith("Z"):
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        if "VALUE=DATE" in head_upper and len(value) == 8:
+            dt = datetime.strptime(value, "%Y%m%d").replace(tzinfo=NZ_TZ)
+            return dt.astimezone(timezone.utc).isoformat()
+        if "T" in value:
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=NZ_TZ)
+            return dt.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        return None
+    return None
+
+
+def parse_ical(text: str) -> list:
+    """Minimal RFC 5545 parser for VRBO/Bookabach exports.
+
+    Returns a list of dicts: {uid, summary, start_ts (UTC ISO), end_ts (UTC ISO)}.
+    Folds RFC-5545 continuation lines (leading space/tab). Skips VEVENTs missing
+    UID / DTSTART / DTEND.
+    """
+    # Unfold per RFC 5545 §3.1: lines starting with space or tab continue the
+    # previous logical line.
+    lines: list = []
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        if raw.startswith((" ", "\t")) and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+
+    events = []
+    current = None
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            current = {}
+        elif line == "END:VEVENT":
+            if current and {"uid", "start_ts", "end_ts"} <= set(current):
+                events.append(current)
+            current = None
+        elif current is not None:
+            if ":" not in line:
+                continue
+            head, _, value = line.partition(":")
+            key = head.split(";")[0].upper()
+            if key == "UID":
+                current["uid"] = value.strip()
+            elif key == "SUMMARY":
+                current["summary"] = value.strip()
+            elif key in ("DTSTART", "DTEND"):
+                parsed = _parse_ical_dt(line)
+                if parsed is not None:
+                    current["start_ts" if key == "DTSTART" else "end_ts"] = parsed
+    return events
+
+
+def sync_bookings_from_ical(url: Optional[str] = None) -> int:
+    """Fetch the configured iCal feed and upsert into bookings.
+
+    Returns the number of upserted events. Returns 0 (silently) if no URL is
+    configured or the fetch/parse fails — this runs in a background loop and
+    must not raise. Supports http(s):// and file:// URLs.
+    """
+    target = url if url is not None else BOOKINGS_ICAL_URL
+    if not target:
+        return 0
+    try:
+        from urllib.request import urlopen, Request
+        req = Request(target, headers={"User-Agent": "watertank-monitor/1.0"})
+        with urlopen(req, timeout=15) as r:
+            text = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return 0
+    events = parse_ical(text)
+    if not events:
+        return 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    cur = conn.cursor()
+    seen_uids = set()
+    for ev in events:
+        seen_uids.add(ev["uid"])
+        cur.execute(
+            """
+            INSERT INTO bookings (source_uid, summary, start_ts, end_ts, last_synced)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source_uid) DO UPDATE SET
+                summary = excluded.summary,
+                start_ts = excluded.start_ts,
+                end_ts = excluded.end_ts,
+                last_synced = excluded.last_synced
+            """,
+            (ev["uid"], ev.get("summary"), ev["start_ts"], ev["end_ts"], now_iso),
+        )
+    # Remove future bookings that are no longer in the feed (cancellations).
+    # Keep historical bookings for analytics.
+    if seen_uids:
+        placeholders = ",".join("?" for _ in seen_uids)
+        cur.execute(
+            f"DELETE FROM bookings WHERE end_ts >= ? AND source_uid NOT IN ({placeholders})",
+            (now_iso, *seen_uids),
+        )
+    conn.commit()
+    conn.close()
+    return len(events)
+
+
+def _bookings_sync_loop() -> None:
+    if not BOOKINGS_ICAL_URL:
+        return  # Nothing to sync; loop exits and the daemon thread cleans up.
+    while True:
+        try:
+            sync_bookings_from_ical()
+        except Exception:
+            pass
+        time.sleep(BOOKINGS_SYNC_INTERVAL_MINUTES * 60)
+
+
 def maybe_trigger_threshold(
     conn: sqlite3.Connection, device_id: str, level_percent: float, threshold: float
 ) -> None:
@@ -603,8 +757,15 @@ async def disable_static_cache(request, call_next):
 @app.on_event("startup")
 def startup() -> None:
     init_db()
-    thread = threading.Thread(target=_occupancy_check_loop, daemon=True)
-    thread.start()
+    threading.Thread(target=_occupancy_check_loop, daemon=True).start()
+    if BOOKINGS_ICAL_URL:
+        # First sync runs synchronously at startup so the dashboard has data
+        # immediately rather than waiting up to BOOKINGS_SYNC_INTERVAL_MINUTES.
+        try:
+            sync_bookings_from_ical()
+        except Exception:
+            pass
+        threading.Thread(target=_bookings_sync_loop, daemon=True).start()
 
 
 @app.get("/")
@@ -745,6 +906,56 @@ def list_readings(
     conn.close()
     rows.reverse()
     return {"readings": rows}
+
+
+@app.get("/api/bookings/current")
+def get_current_booking() -> dict:
+    """Return the booking active right now, or null."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM bookings
+        WHERE start_ts <= ? AND end_ts > ?
+        ORDER BY start_ts ASC
+        LIMIT 1
+        """,
+        (now_iso, now_iso),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return {"booking": dict(row) if row else None}
+
+
+@app.get("/api/bookings/upcoming")
+def get_upcoming_bookings(days: int = Query(default=90, ge=1, le=365)) -> dict:
+    """Return current + future bookings within the next `days`, oldest first."""
+    now = datetime.now(timezone.utc)
+    horizon = (now + timedelta(days=days)).isoformat()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM bookings
+        WHERE end_ts > ? AND start_ts < ?
+        ORDER BY start_ts ASC
+        """,
+        (now.isoformat(), horizon),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"bookings": rows}
+
+
+@app.post("/api/bookings/sync")
+def trigger_bookings_sync(request: Request) -> dict:
+    """Manually trigger an iCal sync. Admin-only (rejects ingest hostname)."""
+    _reject_ingest_host(request)
+    if not BOOKINGS_ICAL_URL:
+        return {"status": "noop", "reason": "BOOKINGS_ICAL_URL not configured"}
+    count = sync_bookings_from_ical()
+    return {"status": "ok", "events_processed": count}
 
 
 @app.get("/api/config")
