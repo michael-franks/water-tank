@@ -951,7 +951,7 @@ function categorizeBooking(b) {
     const name = (b.summary || "").replace(/^reserved\s*-\s*/i, "").trim() || "Guest";
     return { kind: "guest", label: name };
   }
-  return { kind: "owner", label: "Family" };
+  return { kind: "owner", label: "Blocked" };
 }
 
 async function fetchAllBookings() {
