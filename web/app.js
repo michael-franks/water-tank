@@ -7,6 +7,7 @@ const heroLitersEl = document.getElementById("hero-liters");
 const heroDaysEl = document.getElementById("hero-days");
 const heroSensorEl = document.getElementById("hero-sensor");
 const heroOccupancyEl = document.getElementById("hero-occupancy");
+const heroBookingEl = document.getElementById("hero-booking");
 const signalBadgeEl = document.getElementById("signal-badge");
 
 const REFRESH_INTERVAL_MS = 60 * 1000;
@@ -71,6 +72,61 @@ async function fetchUsageAnalysis() {
   } catch (err) {
     return null;
   }
+}
+
+async function fetchUpcomingBookings(days = 90) {
+  try {
+    const response = await fetch(`/api/bookings/upcoming?days=${days}`);
+    if (!response.ok) return [];
+    const payload = await response.json();
+    return payload.bookings || [];
+  } catch (err) {
+    return [];
+  }
+}
+
+// "14 Jun – 21 Jun" (same year as today) or "28 Dec 2026 – 5 Jan 2027" (otherwise).
+function formatBookingDateRange(startIso, endIso) {
+  const s = new Date(startIso);
+  const e = new Date(endIso);
+  const now = new Date();
+  const shortFmt = { day: "numeric", month: "short" };
+  const longFmt = { day: "numeric", month: "short", year: "numeric" };
+  const sShort = s.toLocaleDateString("en-NZ", shortFmt);
+  const eShort = e.toLocaleDateString("en-NZ", shortFmt);
+  const sameYearAsNow = s.getFullYear() === now.getFullYear() && e.getFullYear() === now.getFullYear();
+  if (sameYearAsNow) return `${sShort} – ${eShort}`;
+  return `${s.toLocaleDateString("en-NZ", longFmt)} – ${e.toLocaleDateString("en-NZ", longFmt)}`;
+}
+
+function renderBooking(bookings) {
+  if (!heroBookingEl) return;
+  if (!bookings || bookings.length === 0) {
+    heroBookingEl.textContent = "";
+    heroBookingEl.className = "hero-booking";
+    return;
+  }
+  const now = Date.now();
+  // bookings are oldest-first; current booking is the one whose window contains now.
+  const current = bookings.find(
+    (b) => new Date(b.start_ts).getTime() <= now && new Date(b.end_ts).getTime() > now
+  );
+  if (current) {
+    heroBookingEl.textContent = `📅 Booked: ${formatBookingDateRange(current.start_ts, current.end_ts)}`;
+    heroBookingEl.className = "hero-booking is-booked";
+    return;
+  }
+  const next = bookings.find((b) => new Date(b.start_ts).getTime() > now);
+  if (!next) {
+    heroBookingEl.textContent = "";
+    heroBookingEl.className = "hero-booking";
+    return;
+  }
+  const daysAway = Math.ceil((new Date(next.start_ts).getTime() - now) / 86_400_000);
+  const range = formatBookingDateRange(next.start_ts, next.end_ts);
+  const daysLabel = daysAway === 1 ? "1 day" : `${daysAway} days`;
+  heroBookingEl.textContent = `📅 Next: ${range} (in ${daysLabel})`;
+  heroBookingEl.className = "hero-booking is-upcoming";
 }
 
 async function fetchReadings(since = null, limit = 10080) {
@@ -785,14 +841,16 @@ async function updateDashboard() {
   // to the server's limit cap.
   const window = getRangeWindow(currentRange);
   const since = window ? window.min : null;
-  const [latest, readings, feedinRate, dailyRates, usageAnalysis] = await Promise.all([
+  const [latest, readings, feedinRate, dailyRates, usageAnalysis, bookings] = await Promise.all([
     fetchLatest(),
     fetchReadings(since),
     fetchFeedinRate(),
     fetchDailyFeedinRates(),
     fetchUsageAnalysis(),
+    fetchUpcomingBookings(),
   ]);
   renderLatest(latest);
+  renderBooking(bookings);
   const displayReading =
     latest.sensor_error && latest.last_good_reading
       ? latest.last_good_reading

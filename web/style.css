@@ -241,6 +241,24 @@ header {
   color: #64748b;
 }
 
+.hero-booking {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 14px;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+.hero-booking.is-booked {
+  color: #7c3aed;
+}
+
+.hero-booking.is-upcoming {
+  color: #475569;
+}
+
 .hero-badges {
   display: flex;
   gap: 8px;
@@ -418,7 +436,8 @@ header {
   }
 
   .hero-sensor,
-  .hero-occupancy {
+  .hero-occupancy,
+  .hero-booking {
     justify-content: flex-start;
   }
 
