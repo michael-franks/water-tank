@@ -930,6 +930,177 @@ async function init() {
 init();
 
 // -----------------------------------------------------------------------------
+// Tabs (Dashboard / Calendar) + the Calendar view itself
+// -----------------------------------------------------------------------------
+
+const calendarState = {
+  year: null,
+  month: null, // 0-indexed
+  bookings: null, // null = not yet loaded; [] = loaded but empty
+};
+
+// Categorize a booking by its summary text. Matches Michael's VRBO conventions:
+// "Reserved - <name>" = paying guest; anything mentioning "closed" or "winter" =
+// off-market (no one there); everything else (incl. bare "Blocked") = family.
+function categorizeBooking(b) {
+  const s = (b.summary || "").toLowerCase();
+  if (s.includes("closed") || s.includes("winter")) {
+    return { kind: "closed", label: b.summary || "Closed" };
+  }
+  if (s.startsWith("reserved")) {
+    const name = (b.summary || "").replace(/^reserved\s*-\s*/i, "").trim() || "Guest";
+    return { kind: "guest", label: name };
+  }
+  return { kind: "owner", label: "Family" };
+}
+
+async function fetchAllBookings() {
+  try {
+    const r = await fetch("/api/bookings");
+    if (!r.ok) return [];
+    return (await r.json()).bookings || [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function setupTabs() {
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+      document.querySelectorAll(".tab-btn").forEach((b) => {
+        const isActive = b === btn;
+        b.classList.toggle("active", isActive);
+        b.setAttribute("aria-selected", isActive ? "true" : "false");
+      });
+      document.querySelectorAll(".tab-content").forEach((c) => {
+        c.classList.toggle("active", c.id === `tab-${target}`);
+      });
+      if (target === "calendar") loadCalendar();
+    });
+  });
+}
+
+async function loadCalendar() {
+  if (calendarState.year === null) {
+    const now = new Date();
+    calendarState.year = now.getFullYear();
+    calendarState.month = now.getMonth();
+  }
+  if (calendarState.bookings === null) {
+    calendarState.bookings = await fetchAllBookings();
+  }
+  renderCalendar();
+}
+
+function navigateMonth(delta) {
+  let { year, month } = calendarState;
+  month += delta;
+  if (month < 0) {
+    month = 11;
+    year -= 1;
+  } else if (month > 11) {
+    month = 0;
+    year += 1;
+  }
+  calendarState.year = year;
+  calendarState.month = month;
+  renderCalendar();
+}
+
+function goToToday() {
+  const now = new Date();
+  calendarState.year = now.getFullYear();
+  calendarState.month = now.getMonth();
+  renderCalendar();
+}
+
+function renderCalendar() {
+  const { year, month, bookings } = calendarState;
+  const grid = document.getElementById("calendar-grid");
+  const label = document.getElementById("cal-month-label");
+  if (!grid || !label) return;
+
+  grid.innerHTML = "";
+  label.textContent = new Date(year, month, 1).toLocaleDateString("en-NZ", {
+    month: "long",
+    year: "numeric",
+  });
+
+  // Day-of-week header row.
+  ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].forEach((d) => {
+    const cell = document.createElement("div");
+    cell.className = "cal-dow";
+    cell.textContent = d;
+    grid.appendChild(cell);
+  });
+
+  const firstOfMonth = new Date(year, month, 1);
+  const startDow = firstOfMonth.getDay(); // 0=Sun..6=Sat
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const totalCells = Math.ceil((startDow + daysInMonth) / 7) * 7;
+
+  const today = new Date();
+  const isToday = (d) =>
+    d.getFullYear() === today.getFullYear() &&
+    d.getMonth() === today.getMonth() &&
+    d.getDate() === today.getDate();
+
+  // For each cell, compute the date it represents.
+  for (let i = 0; i < totalCells; i++) {
+    const dayNum = i - startDow + 1;
+    const cellDate = new Date(year, month, dayNum); // JS handles month overflow
+    const isOtherMonth = cellDate.getMonth() !== month;
+
+    const cell = document.createElement("div");
+    cell.className = "cal-day";
+    if (isOtherMonth) cell.classList.add("other-month");
+    if (isToday(cellDate)) cell.classList.add("today");
+
+    const dayNumEl = document.createElement("div");
+    dayNumEl.className = "cal-day-num";
+    dayNumEl.textContent = cellDate.getDate();
+    cell.appendChild(dayNumEl);
+
+    // Bookings active on this date: end_ts > cellStart AND start_ts < cellEnd.
+    // iCal DTEND is exclusive, so a booking ending on day X doesn't cover day X.
+    const cellStart = cellDate.getTime();
+    const cellEnd = cellStart + 86_400_000;
+    const active = (bookings || []).filter((b) => {
+      const bStart = new Date(b.start_ts).getTime();
+      const bEnd = new Date(b.end_ts).getTime();
+      return bStart < cellEnd && bEnd > cellStart;
+    });
+
+    if (active.length > 0) {
+      const pills = document.createElement("div");
+      pills.className = "cal-pills";
+      active.forEach((b) => {
+        const cat = categorizeBooking(b);
+        const pill = document.createElement("div");
+        pill.className = `cal-pill cal-pill-${cat.kind}`;
+        pill.textContent = cat.label;
+        // Tooltip with full date range and original summary.
+        const s = new Date(b.start_ts).toLocaleDateString("en-NZ", { day: "numeric", month: "short", year: "numeric" });
+        const e = new Date(b.end_ts).toLocaleDateString("en-NZ", { day: "numeric", month: "short", year: "numeric" });
+        pill.title = `${b.summary || cat.label}\n${s} → ${e}`;
+        pills.appendChild(pill);
+      });
+      cell.appendChild(pills);
+    }
+
+    grid.appendChild(cell);
+  }
+}
+
+// Wire up calendar navigation.
+document.getElementById("cal-prev")?.addEventListener("click", () => navigateMonth(-1));
+document.getElementById("cal-next")?.addEventListener("click", () => navigateMonth(1));
+document.getElementById("cal-today")?.addEventListener("click", goToToday);
+
+setupTabs();
+
+// -----------------------------------------------------------------------------
 // Notification preferences — fetch on load, POST on toggle, optimistic update
 // with rollback on failure.
 // -----------------------------------------------------------------------------

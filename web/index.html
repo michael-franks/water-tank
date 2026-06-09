@@ -11,6 +11,12 @@
   </head>
   <body>
     <div class="container">
+      <nav class="tab-nav" role="tablist">
+        <button class="tab-btn active" data-tab="dashboard" role="tab" aria-selected="true">Dashboard</button>
+        <button class="tab-btn" data-tab="calendar" role="tab" aria-selected="false">Calendar</button>
+      </nav>
+
+      <div class="tab-content active" id="tab-dashboard" role="tabpanel">
       <section class="hero">
         <div class="hero-main">
           <div class="hero-left">
@@ -94,6 +100,24 @@
           <div class="meta" id="fw-version">Firmware: —</div>
         </div>
       </section>
+      </div>
+
+      <div class="tab-content" id="tab-calendar" role="tabpanel">
+        <section class="hero">
+          <div class="calendar-header">
+            <button class="calendar-nav-btn" id="cal-prev" aria-label="Previous month">‹</button>
+            <h2 class="calendar-month-label" id="cal-month-label">—</h2>
+            <button class="calendar-nav-btn" id="cal-next" aria-label="Next month">›</button>
+            <button class="calendar-nav-btn calendar-today-btn" id="cal-today">Today</button>
+          </div>
+          <div class="calendar-legend">
+            <span class="cal-chip cal-chip-guest">Guests</span>
+            <span class="cal-chip cal-chip-owner">Family</span>
+            <span class="cal-chip cal-chip-closed">Closed</span>
+          </div>
+          <div class="calendar-grid" id="calendar-grid" aria-live="polite"></div>
+        </section>
+      </div>
     </div>
 
     <script src="/static/app.js"></script>

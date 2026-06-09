@@ -908,6 +908,42 @@ def list_readings(
     return {"readings": rows}
 
 
+@app.get("/api/bookings")
+def list_bookings(
+    from_: Optional[str] = Query(default=None, alias="from", description="ISO timestamp; only bookings overlapping at or after this time."),
+    to: Optional[str] = Query(default=None, description="ISO timestamp; only bookings overlapping at or before this time."),
+) -> dict:
+    """All bookings, optionally filtered to those overlapping a [from, to] window.
+    A booking 'overlaps' the window when its end_ts > from AND start_ts < to.
+    """
+    where: list = []
+    params: list = []
+    if from_ is not None:
+        try:
+            datetime.fromisoformat(from_.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid 'from' timestamp") from exc
+        where.append("end_ts > ?")
+        params.append(from_)
+    if to is not None:
+        try:
+            datetime.fromisoformat(to.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid 'to' timestamp") from exc
+        where.append("start_ts < ?")
+        params.append(to)
+    conn = get_db()
+    cur = conn.cursor()
+    sql = "SELECT * FROM bookings"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY start_ts ASC"
+    cur.execute(sql, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"bookings": rows}
+
+
 @app.get("/api/bookings/current")
 def get_current_booking() -> dict:
     """Return the booking active right now, or null."""
