@@ -13,7 +13,7 @@ except ImportError:
     NZ_TZ = timezone(timedelta(hours=12))  # fallback, no DST
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -43,6 +43,13 @@ STALE_CHECK_INTERVAL_MINUTES = int(os.getenv("STALE_CHECK_INTERVAL_MINUTES", "30
 # dashboard treats the bach as 'no bookings known'.
 BOOKINGS_ICAL_URL = os.getenv("BOOKINGS_ICAL_URL", "").strip()
 BOOKINGS_SYNC_INTERVAL_MINUTES = int(os.getenv("BOOKINGS_SYNC_INTERVAL_MINUTES", "60"))
+
+# Firmware OTA: where signed .bin images live on the server. Default is a dir at
+# the repo root (sibling to server/ and web/), so the deploy hook — which only
+# promotes server/ and web/ — never touches it and it survives deploys. Lives on
+# the LXC only; gitignored.
+FIRMWARE_DIR = Path(os.getenv("FIRMWARE_DIR", str(BASE_DIR.parent / "firmware-images")))
+FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Tank calibration: 170mm from sensor to water when full, 2500mm tank depth
 SENSOR_TO_WATER_FULL_CM = 17.0
@@ -207,6 +214,22 @@ def init_db() -> None:
     )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_bookings_range ON bookings(start_ts, end_ts)"
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS firmware_releases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL UNIQUE,
+            filename TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            min_version TEXT,
+            target_device TEXT,
+            notes TEXT,
+            published INTEGER NOT NULL DEFAULT 1,
+            uploaded_at TEXT NOT NULL
+        )
+        """
     )
     # Hot-path index for the dominant query shape:
     # SELECT ... FROM readings WHERE device_id = ? AND ts ... ORDER BY ts DESC
@@ -992,6 +1015,227 @@ def trigger_bookings_sync(request: Request) -> dict:
         return {"status": "noop", "reason": "BOOKINGS_ICAL_URL not configured"}
     count = sync_bookings_from_ical()
     return {"status": "ok", "events_processed": count}
+
+
+# ---------------------------------------------------------------------------
+# Firmware OTA (self-hosted application FOTA for the nRF9160)
+# ---------------------------------------------------------------------------
+
+def _parse_version(v: Optional[str]):
+    """Parse a dotted version like '1.2.3' into a tuple of ints, or None if
+    unparseable. Leading digits of each component are taken ('1.0.0-rc1' →
+    (1,0,0)); a component with no leading digit makes the whole thing None."""
+    if not v:
+        return None
+    parts = []
+    for comp in str(v).strip().split("."):
+        digits = ""
+        for ch in comp:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits == "":
+            return None
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def _version_newer(candidate: Optional[str], current: Optional[str]) -> bool:
+    """True if candidate is strictly newer than current. If current is
+    missing/garbage, any parseable candidate counts as newer."""
+    c = _parse_version(candidate)
+    if c is None:
+        return False
+    cur = _parse_version(current)
+    if cur is None:
+        return True
+    n = max(len(c), len(cur))
+    c = c + (0,) * (n - len(c))
+    cur = cur + (0,) * (n - len(cur))
+    return c > cur
+
+
+def _select_latest_release(rows: list, current: Optional[str]):
+    """Pick the highest-version release the device is eligible for. Eligible =
+    newer than current (or current unknown) AND current satisfies the release's
+    min_version gate if set. Returns the row dict or None."""
+    best = None
+    for r in rows:
+        version = r["version"]
+        if current is not None and not _version_newer(version, current):
+            continue
+        min_v = r.get("min_version")
+        if min_v and current is not None and _version_newer(min_v, current):
+            continue  # device older than the minimum required to take this jump
+        if best is None or _version_newer(version, best["version"]):
+            best = r
+    return best
+
+
+def _sha256_file(path) -> tuple:
+    """Stream a file through SHA-256. Returns (hex_digest, size_bytes)."""
+    import hashlib
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def _firmware_path(relname: str):
+    """Resolve a release filename under FIRMWARE_DIR, rejecting path traversal.
+    Returns the resolved Path, or None if it would escape FIRMWARE_DIR."""
+    base = FIRMWARE_DIR.resolve()
+    path = (FIRMWARE_DIR / relname).resolve()
+    if base != path and base not in path.parents:
+        return None
+    return path
+
+
+class FirmwareRegisterIn(BaseModel):
+    version: str = Field(..., min_length=1)
+    filename: Optional[str] = Field(
+        default=None,
+        description="Path relative to FIRMWARE_DIR. Defaults to <version>/app_update.bin",
+    )
+    min_version: Optional[str] = None
+    target_device: Optional[str] = None
+    notes: Optional[str] = None
+    published: bool = True
+
+
+@app.post("/api/firmware/register")
+def firmware_register(body: FirmwareRegisterIn, request: Request) -> dict:
+    """Register a firmware release. The .bin must already be on the LXC under
+    FIRMWARE_DIR (scp it there first). The server computes sha256 + size itself —
+    it never trusts a client-supplied hash. Admin-only (rejects ingest host)."""
+    _reject_ingest_host(request)
+    relname = body.filename or f"{body.version}/app_update.bin"
+    path = _firmware_path(relname)
+    if path is None:
+        raise HTTPException(status_code=400, detail="Invalid filename path")
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail=f"File not found under FIRMWARE_DIR: {relname}")
+    digest, size = _sha256_file(path)
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO firmware_releases
+            (version, filename, sha256, size_bytes, min_version, target_device, notes, published, uploaded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(version) DO UPDATE SET
+            filename = excluded.filename, sha256 = excluded.sha256,
+            size_bytes = excluded.size_bytes, min_version = excluded.min_version,
+            target_device = excluded.target_device, notes = excluded.notes,
+            published = excluded.published, uploaded_at = excluded.uploaded_at
+        """,
+        (body.version, relname, digest, size, body.min_version,
+         body.target_device, body.notes, 1 if body.published else 0, now),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "version": body.version, "sha256": digest, "size_bytes": size}
+
+
+@app.get("/api/firmware/releases")
+def firmware_list_releases() -> dict:
+    """All registered releases, newest first."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT version, filename, sha256, size_bytes, min_version, target_device,
+               notes, published, uploaded_at
+        FROM firmware_releases ORDER BY uploaded_at DESC
+        """
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"releases": rows}
+
+
+@app.get("/api/firmware/latest")
+def firmware_latest(
+    current: Optional[str] = Query(default=None, description="Device's current fw version."),
+    device: str = Query(default=DEFAULT_DEVICE_ID),
+):
+    """Newest eligible release for a device, or 204 if already up to date.
+    Reachable on the ingest hostname — the device polls this unauthenticated."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM firmware_releases WHERE published = 1 AND (target_device IS NULL OR target_device = ?)",
+        (device,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    best = _select_latest_release(rows, current)
+    if best is None:
+        return Response(status_code=204)
+    return {
+        "version": best["version"],
+        "path": f"/api/firmware/download/{best['version']}",
+        "sha256": best["sha256"],
+        "size_bytes": best["size_bytes"],
+        "notes": best["notes"],
+    }
+
+
+@app.get("/api/firmware/download/{version}")
+def firmware_download(version: str):
+    """Serve a firmware binary. Starlette's FileResponse honours HTTP Range, so
+    a download resumes after a dropped LTE connection rather than restarting."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT filename FROM firmware_releases WHERE version = ?", (version,))
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown firmware version")
+    path = _firmware_path(row["filename"])
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Firmware file missing on server")
+    return FileResponse(
+        path, media_type="application/octet-stream", filename=f"app_update_{version}.bin"
+    )
+
+
+@app.get("/api/firmware/status")
+def firmware_status(device: str = Query(default=DEFAULT_DEVICE_ID)) -> dict:
+    """Current reported version (from the latest reading) vs latest available.
+    Drives the dashboard line and enables closed-loop rollback detection."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT fw_version, ts FROM readings WHERE device_id = ? AND fw_version IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        (device,),
+    )
+    r = cur.fetchone()
+    current = r["fw_version"] if r else None
+    last_seen = r["ts"] if r else None
+    cur.execute(
+        "SELECT * FROM firmware_releases WHERE published = 1 AND (target_device IS NULL OR target_device = ?)",
+        (device,),
+    )
+    rows = [dict(x) for x in cur.fetchall()]
+    conn.close()
+    latest = None
+    for rel in rows:
+        if latest is None or _version_newer(rel["version"], latest):
+            latest = rel["version"]
+    up_to_date = bool(latest and current and not _version_newer(latest, current))
+    return {
+        "device": device,
+        "current": current,
+        "latest": latest,
+        "up_to_date": up_to_date,
+        "last_seen": last_seen,
+    }
 
 
 @app.get("/api/config")

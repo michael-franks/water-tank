@@ -27,6 +27,9 @@ Thumbs.db
 firmware/build/
 firmware/.west/
 
+# OTA firmware images — signed .bin files live on the LXC only, never in git
+firmware-images/
+
 # Deploy backups created by the post-receive hook (in case any leak locally)
 *.deploybak
 .deploybak/

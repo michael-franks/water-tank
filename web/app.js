@@ -835,22 +835,49 @@ function updateDaysRemaining(reading, usageAnalysis) {
   }
 }
 
+async function fetchFirmwareStatus() {
+  try {
+    const r = await fetch("/api/firmware/status");
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (err) {
+    return null;
+  }
+}
+
+function renderFirmware(status) {
+  if (!fwVersionEl || !status) return; // leave whatever renderLatest set
+  if (!status.current) {
+    fwVersionEl.textContent = "Firmware: —";
+    return;
+  }
+  let text = `Firmware: v${status.current}`;
+  if (status.latest && !status.up_to_date) {
+    text += ` · update available: v${status.latest}`;
+  } else if (status.up_to_date) {
+    text += " · up to date";
+  }
+  fwVersionEl.textContent = text;
+}
+
 async function updateDashboard() {
   // Pass since= so /api/readings returns only what the chart needs, instead of
   // dragging ALL readings every minute. 'All time' (window=null) falls through
   // to the server's limit cap.
   const window = getRangeWindow(currentRange);
   const since = window ? window.min : null;
-  const [latest, readings, feedinRate, dailyRates, usageAnalysis, bookings] = await Promise.all([
+  const [latest, readings, feedinRate, dailyRates, usageAnalysis, bookings, firmware] = await Promise.all([
     fetchLatest(),
     fetchReadings(since),
     fetchFeedinRate(),
     fetchDailyFeedinRates(),
     fetchUsageAnalysis(),
     fetchUpcomingBookings(),
+    fetchFirmwareStatus(),
   ]);
   renderLatest(latest);
   renderBooking(bookings);
+  renderFirmware(firmware);
   const displayReading =
     latest.sensor_error && latest.last_good_reading
       ? latest.last_good_reading
