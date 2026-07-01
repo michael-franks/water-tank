@@ -537,6 +537,12 @@ header {
   color: #64748b;
 }
 
+.chart-empty {
+  margin: 10px 0 0 0;
+  font-size: 13px;
+  color: #64748b;
+}
+
 .chart-toggles {
   display: flex;
   gap: 12px;

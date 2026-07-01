@@ -423,11 +423,11 @@ function renderChart(readings) {
           spanGaps: true,
           yAxisID: "yPercent",
           fill: false,
-          pointRadius: (ctx) => (ctx.raw.condensation_error ? 4 : 0),
+          pointRadius: (ctx) => (ctx.raw?.condensation_error ? 4 : 0),
           pointBackgroundColor: (ctx) =>
-            ctx.raw.condensation_error ? "#dc2626" : "#4f46e5",
+            ctx.raw?.condensation_error ? "#dc2626" : "#4f46e5",
           pointBorderColor: (ctx) =>
-            ctx.raw.condensation_error ? "#b91c1c" : "#4f46e5",
+            ctx.raw?.condensation_error ? "#b91c1c" : "#4f46e5",
           pointBorderWidth: 1,
         },
         {
@@ -439,11 +439,11 @@ function renderChart(readings) {
           spanGaps: true,
           yAxisID: "yDistance",
           hidden: true, // Hidden by default
-          pointRadius: (ctx) => (ctx.raw.condensation_error ? 4 : 0),
+          pointRadius: (ctx) => (ctx.raw?.condensation_error ? 4 : 0),
           pointBackgroundColor: (ctx) =>
-            ctx.raw.condensation_error ? "#dc2626" : "#16a34a",
+            ctx.raw?.condensation_error ? "#dc2626" : "#16a34a",
           pointBorderColor: (ctx) =>
-            ctx.raw.condensation_error ? "#b91c1c" : "#16a34a",
+            ctx.raw?.condensation_error ? "#b91c1c" : "#16a34a",
           pointBorderWidth: 1,
         },
       ],
@@ -631,15 +631,15 @@ function renderFeedinChart(dailyRates, feedinRate) {
       fill: true,
       pointRadius: 4,
       pointBackgroundColor: (ctx) =>
-        ctx.raw.condensation_error
+        ctx.raw?.condensation_error
           ? "#dc2626"
-          : ctx.raw.reached_full
+          : ctx.raw?.reached_full
             ? "#22c55e"
             : "#3b82f6",
       pointBorderColor: (ctx) =>
-        ctx.raw.condensation_error
+        ctx.raw?.condensation_error
           ? "#b91c1c"
-          : ctx.raw.reached_full
+          : ctx.raw?.reached_full
             ? "#16a34a"
             : "#2563eb",
       pointBorderWidth: 1,
@@ -742,15 +742,15 @@ function updateFeedinChart(chart, dailyRates, feedinRate) {
 
   chart.data.datasets[0].data = data;
   chart.data.datasets[0].pointBackgroundColor = (ctx) =>
-    ctx.raw.condensation_error
+    ctx.raw?.condensation_error
       ? "#dc2626"
-      : ctx.raw.reached_full
+      : ctx.raw?.reached_full
         ? "#22c55e"
         : "#3b82f6";
   chart.data.datasets[0].pointBorderColor = (ctx) =>
-    ctx.raw.condensation_error
+    ctx.raw?.condensation_error
       ? "#b91c1c"
-      : ctx.raw.reached_full
+      : ctx.raw?.reached_full
         ? "#16a34a"
         : "#2563eb";
   chart.data.datasets[0].segment = {
@@ -893,6 +893,8 @@ async function updateDashboard() {
   const feedinLegendEl = document.getElementById("feedin-legend");
   if (historyLegendEl) historyLegendEl.style.display = hasHistoryError ? "block" : "none";
   if (feedinLegendEl) feedinLegendEl.style.display = hasFeedinError ? "block" : "none";
+  const historyEmptyEl = document.getElementById("history-empty");
+  if (historyEmptyEl) historyEmptyEl.style.display = readings.length === 0 ? "block" : "none";
   if (!historyChart) {
     historyChart = renderChart(readings);
   } else {
