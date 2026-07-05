@@ -1,4 +1,4 @@
 fastapi==0.115.8
 uvicorn==0.30.5
 python-dotenv==1.0.1
-twilio==9.2.3
+pywebpush==2.3.0

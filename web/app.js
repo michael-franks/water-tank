@@ -1152,6 +1152,149 @@ if ("serviceWorker" in navigator) {
 })();
 
 // -----------------------------------------------------------------------------
+// Web push: enable/disable alerts on this device, with iOS install gating.
+// Mirrors the Crumb PWA's push UX. iOS only delivers push to a PWA that's been
+// added to the Home Screen (iOS 16.4+), and permission must be tapped from
+// inside the installed app — hence the install hint below.
+// -----------------------------------------------------------------------------
+(function initPush() {
+  const el = document.getElementById("push-control");
+  if (!el) return;
+
+  const pushSupported = () =>
+    "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  const isStandalone = () =>
+    (window.matchMedia && matchMedia("(display-mode: standalone)").matches) ||
+    navigator.standalone === true;
+  const isIOS = () =>
+    /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+  function urlB64ToUint8Array(b64) {
+    const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+    const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+  }
+
+  let serverSubs = 0;
+  let pushConfigured = false;
+
+  async function refreshServerState() {
+    try {
+      const s = await (await fetch("/api/settings")).json();
+      pushConfigured = !!s.push_configured;
+      serverSubs = s.push_subscriptions || 0;
+    } catch (_) {}
+  }
+
+  async function subscribeAndStore() {
+    const reg = await navigator.serviceWorker.ready;
+    const key = (await (await fetch("/api/push/vapid-public-key")).json()).key;
+    if (!key) throw new Error("no server key");
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlB64ToUint8Array(key),
+      });
+    }
+    await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sub.toJSON()),
+    });
+  }
+
+  async function enable() {
+    try {
+      if (!pushSupported()) return;
+      await navigator.serviceWorker.ready;
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") { render(); return; }
+      await subscribeAndStore();
+      localStorage.setItem("watertank_push", "1");
+      await refreshServerState();
+      render();
+    } catch (e) {
+      console.warn("push enable failed", e);
+      render();
+    }
+  }
+
+  async function disable() {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        try {
+          await fetch("/api/push/unsubscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ endpoint: sub.endpoint }),
+          });
+        } catch (_) {}
+        try { await sub.unsubscribe(); } catch (_) {}
+      }
+      localStorage.removeItem("watertank_push");
+      await refreshServerState();
+      render();
+    } catch (e) {
+      console.warn("push disable failed", e);
+    }
+  }
+
+  async function test() {
+    try { await fetch("/api/push/test", { method: "POST" }); } catch (_) {}
+  }
+
+  // Silent re-subscribe when permission is granted but the server lost the sub
+  // (e.g. after a DB reset or the browser rotated the subscription).
+  async function maybeResubscribe() {
+    try {
+      if (!pushSupported() || Notification.permission !== "granted") return;
+      if (localStorage.getItem("watertank_push") !== "1" || serverSubs !== 0) return;
+      await subscribeAndStore();
+      await refreshServerState();
+      render();
+    } catch (_) {}
+  }
+
+  function render() {
+    let html;
+    if (!pushConfigured) {
+      html = '<span class="push-hint">Push not configured on the server.</span>';
+    } else if (!pushSupported()) {
+      html = '<span class="push-hint">This browser can’t show notifications.</span>';
+    } else if (isIOS() && !isStandalone()) {
+      html = '<span class="push-hint">To get alerts on your iPhone: tap Share → <b>Add to Home Screen</b>, then open Bach Tank from the home screen and enable alerts there.</span>';
+    } else if (Notification.permission === "denied") {
+      html = '<span class="push-hint">Notifications are blocked. On iPhone: Settings → Notifications → Bach Tank → Allow, then reopen.</span>';
+    } else if (Notification.permission === "granted" && localStorage.getItem("watertank_push") === "1") {
+      html =
+        '<span class="push-on">✓ Alerts on for this device</span> ' +
+        '<button type="button" class="push-btn" id="push-test">Test</button> ' +
+        '<button type="button" class="push-btn push-btn-ghost" id="push-off">Turn off</button>';
+    } else {
+      html = '<button type="button" class="push-btn" id="push-enable">Enable alerts on this device</button>';
+    }
+    el.innerHTML = html;
+    const be = document.getElementById("push-enable");
+    if (be) be.addEventListener("click", enable);
+    const bt = document.getElementById("push-test");
+    if (bt) bt.addEventListener("click", test);
+    const bo = document.getElementById("push-off");
+    if (bo) bo.addEventListener("click", disable);
+  }
+
+  (async () => {
+    render(); // instant paint from local state
+    await refreshServerState();
+    render();
+    maybeResubscribe();
+  })();
+})();
+
+// -----------------------------------------------------------------------------
 // Notification preferences — fetch on load, POST on toggle, optimistic update
 // with rollback on failure.
 // -----------------------------------------------------------------------------

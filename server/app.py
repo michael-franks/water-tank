@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import threading
@@ -17,11 +18,6 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-
-try:
-    from twilio.rest import Client as TwilioClient
-except Exception:  # pragma: no cover - optional dependency at runtime
-    TwilioClient = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -106,19 +102,12 @@ def _feedin_avg_rate_from_readings(readings: list) -> Optional[tuple]:
         avg_rate = 0.0
     return (avg_rate, first_level, last_level, reached_100)
 
-ALERT_SMS_TO = os.getenv("ALERT_SMS_TO", "").strip()
-# Comma-separated list of email addresses to receive alerts
-ALERT_EMAIL_TO = [e.strip() for e in os.getenv("ALERT_EMAIL_TO", "").split(",") if e.strip()]
-
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
-
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
-SMTP_FROM = os.getenv("SMTP_FROM", "").strip()
+# Web push (VAPID). Base64url keys; the private key stays server-side, the public
+# key is handed to the browser as the applicationServerKey. Push is disabled
+# (notify() becomes a no-op) if any of the three are unset.
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
 
 
 class ReadingIn(BaseModel):
@@ -231,6 +220,16 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            endpoint TEXT PRIMARY KEY,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     # Hot-path index for the dominant query shape:
     # SELECT ... FROM readings WHERE device_id = ? AND ts ... ORDER BY ts DESC
     cur.execute(
@@ -289,30 +288,81 @@ def parse_ts(ts: Optional[str]) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def send_sms(message: str) -> None:
-    if not (ALERT_SMS_TO and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
-        return
-    if TwilioClient is None:
-        return
-    client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    client.messages.create(to=ALERT_SMS_TO, from_=TWILIO_FROM_NUMBER, body=message)
+def _push_configured() -> bool:
+    return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT)
 
 
-def send_email(subject: str, body: str) -> None:
-    if not (ALERT_EMAIL_TO and SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM):
-        return
-    import smtplib
-    from email.message import EmailMessage
+def get_push_subscriptions(conn: sqlite3.Connection) -> list:
+    cur = conn.cursor()
+    cur.execute("SELECT endpoint, p256dh, auth FROM push_subscriptions")
+    return [dict(r) for r in cur.fetchall()]
 
-    msg = EmailMessage()
-    msg["From"] = SMTP_FROM
-    msg["To"] = ", ".join(ALERT_EMAIL_TO)
-    msg["Subject"] = subject
-    msg.set_content(body)
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg, to_addrs=ALERT_EMAIL_TO)
+
+def add_push_subscription(sub: dict) -> None:
+    endpoint = sub.get("endpoint")
+    keys = sub.get("keys") or {}
+    p256dh = keys.get("p256dh")
+    auth = keys.get("auth")
+    if not (endpoint and p256dh and auth):
+        raise HTTPException(status_code=400, detail="Invalid push subscription")
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth
+        """,
+        (endpoint, p256dh, auth, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_push_subscription(endpoint: str) -> None:
+    conn = get_db()
+    conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+    conn.commit()
+    conn.close()
+
+
+def notify(title: str, body: str, url: str = "/", tag: str = "watertank") -> int:
+    """Send a web push to every stored subscription. Prunes dead (404/410) subs.
+    No-op (returns 0) if push isn't configured. Never raises to callers — a
+    notification failure must not break reading ingestion."""
+    if not _push_configured():
+        return 0
+    conn = get_db()
+    subs = get_push_subscriptions(conn)
+    conn.close()
+    if not subs:
+        return 0
+    try:
+        from pywebpush import webpush, WebPushException
+    except Exception:
+        return 0
+    payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag})
+    sent = 0
+    dead = []
+    for s in subs:
+        info = {"endpoint": s["endpoint"], "keys": {"p256dh": s["p256dh"], "auth": s["auth"]}}
+        try:
+            webpush(
+                subscription_info=info,
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_SUBJECT},
+                ttl=3600,
+            )
+            sent += 1
+        except WebPushException as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (404, 410):
+                dead.append(s["endpoint"])  # subscription gone — prune it
+        except Exception:
+            pass
+    for endpoint in dead:
+        remove_push_subscription(endpoint)
+    return sent
 
 
 def ensure_alert_state(conn: sqlite3.Connection, device_id: str, alert_type: str) -> None:
@@ -477,7 +527,7 @@ def handle_reading_arrival(conn: sqlite3.Connection, device_id: str, ts: datetim
         duration_note = ""
         if last_change is not None:
             duration_note = f" after {format_duration_human(ts - last_change)} offline"
-        send_email(
+        notify(
             "Bach occupied",
             f"Water tank circuit came back online on {format_local_time(ts)}"
             f"{duration_note}. Someone has likely arrived at the bach.",
@@ -513,7 +563,7 @@ def check_occupancy_unoccupied() -> None:
     log_occupancy_transition(conn, DEFAULT_DEVICE_ID, "occupied", "unoccupied", now)
     conn.close()
     if _occupancy_alerts_enabled():
-        send_email(
+        notify(
             "Bach unoccupied",
             f"No reading received from the water tank in over {STALE_READING_HOURS:.0f} hours. "
             f"Last reading was {format_duration_human(now - last_ts)} ago "
@@ -681,8 +731,7 @@ def maybe_trigger_threshold(
 
     if level_percent <= threshold and armed == 1:
         message = f"Water level is below {threshold:.0f}%."
-        send_sms(message)
-        send_email("Water level alert", message)
+        notify("Water level alert", message)
         set_alert_state(conn, device_id, alert_type, 0, datetime.now(timezone.utc).isoformat())
     elif level_percent >= threshold + ALERT_HYSTERESIS_PCT and armed == 0:
         set_alert_state(conn, device_id, alert_type, 1, None)
@@ -727,8 +776,7 @@ def maybe_trigger_rapid_change(
         if ts - last_ts < timedelta(hours=hours):
             return
     message = f"Water level dropped by {threshold_pct:.0f}% or more within {hours} hours."
-    send_sms(message)
-    send_email(alert_name, message)
+    notify(alert_name, message)
     set_alert_state(conn, device_id, alert_type, 1, ts.isoformat())
 
 
@@ -755,8 +803,7 @@ def maybe_trigger_sensor_error(
             "This may indicate condensation on the sensor or a sensor malfunction. "
             "Please check the sensor."
         )
-        send_sms(message)
-        send_email("Sensor Error Alert", message)
+        notify("Sensor Error Alert", message)
         set_alert_state(conn, device_id, alert_type, 0, ts.isoformat())
     # Re-arm if reading returns to normal (>= 12cm)
     elif distance_cm >= 12.0 and armed == 0:
@@ -1569,10 +1616,15 @@ class SettingsIn(BaseModel):
 
 @app.get("/api/settings")
 def read_settings() -> dict:
-    """Current notification preferences."""
+    """Current notification preferences + push status (for the dashboard)."""
+    conn = get_db()
+    subs = len(get_push_subscriptions(conn))
+    conn.close()
     return {
         "notify_water_alerts": _water_alerts_enabled(),
         "notify_occupancy": _occupancy_alerts_enabled(),
+        "push_configured": _push_configured(),
+        "push_subscriptions": subs,
     }
 
 
@@ -1587,20 +1639,46 @@ def write_settings(s: SettingsIn, request: Request) -> dict:
     return read_settings()
 
 
-@app.post("/api/test-email")
-def test_email(request: Request) -> dict:
-    """Send a test email to verify SMTP configuration."""
+# ---------------------------------------------------------------------------
+# Web push subscription endpoints
+# ---------------------------------------------------------------------------
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str
+    keys: dict
+    expirationTime: Optional[float] = None
+
+
+@app.get("/api/push/vapid-public-key")
+def push_vapid_public_key() -> dict:
+    """The applicationServerKey the browser needs to subscribe. Public by design."""
+    return {"key": VAPID_PUBLIC_KEY}
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe(sub: PushSubscriptionIn, request: Request) -> dict:
+    """Store a browser push subscription. Admin-only (rejects the ingest host) so
+    a stranger on the unauthenticated ingest hostname can't subscribe to alerts."""
     _reject_ingest_host(request)
-    try:
-        send_email(
-            "Water Tank Monitor - Test Email",
-            "This is a test email from the Water Tank Monitor system.\n\n"
-            "If you received this, email alerts are configured correctly!\n\n"
-            f"Test sent at: {datetime.now(timezone.utc).isoformat()}"
-        )
-        return {"status": "ok", "message": "Test email sent successfully"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    add_push_subscription(sub.model_dump())
+    return {"status": "ok"}
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe(body: dict, request: Request) -> dict:
+    _reject_ingest_host(request)
+    endpoint = body.get("endpoint")
+    if endpoint:
+        remove_push_subscription(endpoint)
+    return {"status": "ok"}
+
+
+@app.post("/api/push/test")
+def push_test(request: Request) -> dict:
+    """Send a test push to every subscription on this account."""
+    _reject_ingest_host(request)
+    sent = notify("Bach Tank", "Test notification — push is working ✅", "/", "test")
+    return {"status": "ok", "sent": sent, "configured": _push_configured()}
 
 
 if __name__ == "__main__":
