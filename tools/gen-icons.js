@@ -76,14 +76,21 @@ function sample(x, y, S, opts) {
   }
   const k = opts.artScale;
   const cx = S / 2;
-  // Teardrop = round bulb + cone tapering to a point above it.
-  const cy = S * 0.5 + S * 0.08 * k;   // bulb centre, a touch below middle
-  const r = S * 0.26 * k;              // bulb radius
-  const apexY = cy - S * 0.42 * k;     // pointed top
-  const inBulb = ((x - cx) * (x - cx) + (y - cy) * (y - cy)) <= r * r;
+  // Teardrop as ONE smooth shape: a round bulb whose sides are the tangent lines
+  // from the apex to the circle. Using the tangent points (not the circle's
+  // equator) means the straight sides meet the arc slope-continuously — no kink,
+  // no "two shapes" look. Region = bulb disk ∪ triangle(apex, tangentL, tangentR).
+  const cy = S * 0.5 + S * 0.08 * k;    // bulb centre, a touch below middle
+  const r = S * 0.26 * k;               // bulb radius
+  const apexY = cy - S * 0.46 * k;      // pointed top
+  const d = cy - apexY;                 // apex-to-centre distance (must exceed r)
+  const root = Math.sqrt(Math.max(d * d - r * r, 0));
+  const tangentY = cy - (r * r) / d;    // y of the two tangent points
+  const tangentHalfW = (r * root) / d;  // half-width of the shape there
+  const inBulb = (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r;
   let inCone = false;
-  if (y >= apexY && y <= cy) {
-    const halfW = r * (y - apexY) / (cy - apexY);
+  if (y >= apexY && y <= tangentY) {
+    const halfW = tangentHalfW * (y - apexY) / (tangentY - apexY);
     inCone = Math.abs(x - cx) <= halfW;
   }
   if (inBulb || inCone) {
