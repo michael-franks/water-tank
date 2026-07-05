@@ -999,14 +999,61 @@ def latest_reading(device_id: str = Query(default=DEFAULT_DEVICE_ID)) -> dict:
     return out
 
 
+def _bucket_readings(rows: list, device_id: str, bucket: str) -> list:
+    """Aggregate raw readings into NZ-local time buckets (hour/day/week), averaging
+    level_percent and distance_cm. Keeps the readings shape so the dashboard chart
+    works unchanged. Bucket ts is the bucket start as a UTC ISO string."""
+    groups: dict = {}
+    order: list = []
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(r["ts"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        local = ts.astimezone(NZ_TZ)
+        if bucket == "hour":
+            key_local = local.replace(minute=0, second=0, microsecond=0)
+        elif bucket == "day":
+            key_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:  # week: Monday 00:00 NZ
+            key_local = (local - timedelta(days=local.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        key = key_local.astimezone(timezone.utc).isoformat()
+        if key not in groups:
+            groups[key] = {"lvl": [], "dist": [], "n": 0}
+            order.append(key)
+        g = groups[key]
+        g["n"] += 1
+        if r.get("level_percent") is not None:
+            g["lvl"].append(r["level_percent"])
+        if r.get("distance_cm") is not None:
+            g["dist"].append(r["distance_cm"])
+    out = []
+    for key in order:
+        g = groups[key]
+        out.append({
+            "device_id": device_id,
+            "ts": key,
+            "level_percent": round(sum(g["lvl"]) / len(g["lvl"]), 1) if g["lvl"] else None,
+            "distance_cm": round(sum(g["dist"]) / len(g["dist"]), 1) if g["dist"] else None,
+            "count": g["n"],
+        })
+    return out
+
+
 @app.get("/api/readings")
 def list_readings(
     device_id: str = Query(default=DEFAULT_DEVICE_ID),
     limit: int = Query(default=10080, ge=1, le=20000),
     since: Optional[str] = Query(default=None, description="ISO timestamp; return readings at or after this time."),
     until: Optional[str] = Query(default=None, description="ISO timestamp; return readings at or before this time."),
+    bucket: Optional[str] = Query(default=None, description="Downsample to NZ-local 'hour', 'day', or 'week' averages; omit for raw readings."),
 ) -> dict:
-    """Returns readings ordered oldest→newest, filtered by optional time window."""
+    """Returns readings ordered oldest→newest, filtered by optional time window and
+    optionally downsampled to time-bucket averages (keeps long ranges uncluttered)."""
     where = ["device_id = ?"]
     params: list = [device_id]
     if since is not None:
@@ -1031,6 +1078,8 @@ def list_readings(
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     rows.reverse()
+    if bucket in ("hour", "day", "week"):
+        return {"readings": _bucket_readings(rows, device_id, bucket), "bucket": bucket}
     return {"readings": rows}
 
 

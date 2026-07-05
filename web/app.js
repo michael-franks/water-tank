@@ -36,7 +36,8 @@ async function fetchConfig() {
 
 let historyChart = null;
 let feedinChart = null;
-let currentRange = { type: "preset", value: "1w" };
+let currentRange = { type: "month", offset: 0 };
+let currentBlock = null;
 
 async function fetchLatest() {
   const response = await fetch("/api/latest");
@@ -129,76 +130,85 @@ function renderBooking(bookings) {
   heroBookingEl.className = "hero-booking is-upcoming";
 }
 
-async function fetchReadings(since = null, limit = 10080) {
+async function fetchReadings(since = null, until = null, bucket = null, limit = 20000) {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
-  if (since != null) {
-    params.set("since", new Date(since).toISOString());
-  }
+  if (since != null) params.set("since", new Date(since).toISOString());
+  if (until != null) params.set("until", new Date(until).toISOString());
+  if (bucket && bucket !== "none") params.set("bucket", bucket);
   const response = await fetch(`/api/readings?${params}`);
   const payload = await response.json();
   return payload.readings || [];
 }
 
-function getRangeWindow(range) {
-  if (!range) return null;
-  const now = Date.now();
-  if (range.type === "preset") {
-    switch (range.value) {
-      case "1d":
-        return { min: now - 24 * 60 * 60 * 1000, max: now };
-      case "1w":
-        return { min: now - 7 * 24 * 60 * 60 * 1000, max: now };
-      case "1m":
-        return { min: now - 30 * 24 * 60 * 60 * 1000, max: now };
-      case "1y":
-        return { min: now - 365 * 24 * 60 * 60 * 1000, max: now };
-      case "all":
-        return null;
-      default:
-        return null;
-    }
+// Range model: { type: 'day'|'week'|'month'|'year'|'all', offset } where offset is
+// whole blocks back from the current one (0 = current). computeBlock turns that
+// into a concrete window + a human label + the server downsample bucket + x unit.
+function startOfDay(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function computeBlock(range) {
+  const now = new Date();
+  const o = Math.max(0, range.offset || 0);
+  const short = { day: "numeric", month: "short" };
+  if (range.type === "all") {
+    return { min: null, max: now.getTime(), label: "All time", bucket: "week", unit: "month", canStep: false };
   }
-  if (range.type === "custom") {
-    const value = range.value;
-    const unit = range.unit;
-    const unitMs = {
-      hours: 60 * 60 * 1000,
-      days: 24 * 60 * 60 * 1000,
-      weeks: 7 * 24 * 60 * 60 * 1000,
-      months: 30 * 24 * 60 * 60 * 1000,
-      years: 365 * 24 * 60 * 60 * 1000,
+  if (range.type === "day") {
+    const s = startOfDay(now); s.setDate(s.getDate() - o);
+    const e = new Date(s); e.setDate(e.getDate() + 1);
+    return {
+      min: s.getTime(), max: Math.min(e.getTime(), now.getTime()),
+      label: s.toLocaleDateString("en-NZ", { weekday: "short", day: "numeric", month: "short" }),
+      bucket: "none", unit: "hour", canStep: true,
     };
-    const ms = value * (unitMs[unit] || 0);
-    if (!ms) return null;
-    return { min: now - ms, max: now };
   }
-  return null;
+  if (range.type === "week") {
+    const s = startOfDay(now);
+    s.setDate(s.getDate() - ((s.getDay() + 6) % 7) - o * 7); // back to Monday, then o weeks
+    const e = new Date(s); e.setDate(e.getDate() + 7);
+    const eLbl = new Date(e); eLbl.setDate(eLbl.getDate() - 1);
+    return {
+      min: s.getTime(), max: Math.min(e.getTime(), now.getTime()),
+      label: `${s.toLocaleDateString("en-NZ", short)} – ${eLbl.toLocaleDateString("en-NZ", short)}`,
+      bucket: "hour", unit: "day", canStep: true,
+    };
+  }
+  if (range.type === "month") {
+    const s = new Date(now.getFullYear(), now.getMonth() - o, 1);
+    const e = new Date(now.getFullYear(), now.getMonth() - o + 1, 1);
+    return {
+      min: s.getTime(), max: Math.min(e.getTime(), now.getTime()),
+      label: s.toLocaleDateString("en-NZ", { month: "long", year: "numeric" }),
+      bucket: "day", unit: "day", canStep: true,
+    };
+  }
+  const s = new Date(now.getFullYear() - o, 0, 1);
+  const e = new Date(now.getFullYear() - o + 1, 0, 1);
+  return {
+    min: s.getTime(), max: Math.min(e.getTime(), now.getTime()),
+    label: String(now.getFullYear() - o),
+    bucket: "week", unit: "month", canStep: true,
+  };
 }
 
-function getTimeUnit(window) {
-  if (!window) return "month";
-  const rangeMs = window.max - window.min;
-  const dayMs = 24 * 60 * 60 * 1000;
-  if (rangeMs <= 2 * dayMs) return "hour";
-  if (rangeMs <= 14 * dayMs) return "day";
-  if (rangeMs <= 90 * dayMs) return "week";
-  if (rangeMs <= 400 * dayMs) return "month";
-  return "year";
+function saveRange() {
+  try { localStorage.setItem("tankRange2", JSON.stringify(currentRange)); } catch (e) {}
 }
 
-
-function setActiveRangeButton(range) {
-  document.querySelectorAll(".range-btn").forEach((btn) => {
-    btn.classList.toggle(
-      "active",
-      range.type === "preset" && btn.dataset.range === range.value
-    );
+function renderRangeControls(block) {
+  document.querySelectorAll("#range-pills button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.range === currentRange.type);
   });
-  const presetSelect = document.getElementById("preset-range-select");
-  if (presetSelect && range.type === "preset") {
-    presetSelect.value = range.value;
-  }
+  const labelEl = document.getElementById("range-label");
+  if (labelEl) labelEl.textContent = block.label;
+  const stepper = document.getElementById("range-stepper");
+  if (stepper) stepper.style.visibility = block.canStep ? "visible" : "hidden";
+  const next = document.getElementById("range-next");
+  if (next) next.disabled = (currentRange.offset || 0) <= 0;
 }
 
 function formatPercent(value) {
@@ -359,92 +369,27 @@ function renderLatest(payload) {
 }
 
 
-const historyLevelFillPlugin = {
-  id: "historyLevelFill",
-  beforeDatasetDraw(chart, args) {
-    if (chart.canvas.id !== "historyChart" || args.index !== 0) return;
-    const meta = chart.getDatasetMeta(0);
-    const data = chart.data.datasets[0].data;
-    if (!meta.data.length || !data.length) return;
-    const yScale = chart.scales.yPercent;
-    const y0 = yScale.getPixelForValue(0);
-    const ctx = chart.ctx;
-    const ca = chart.chartArea;
-    // Clip to the chart plot area so fills don't leak into axis label space.
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(ca.left, ca.top, ca.right - ca.left, ca.bottom - ca.top);
-    ctx.clip();
-    for (let i = 0; i < meta.data.length - 1; i++) {
-      const p0 = meta.data[i];
-      const p1 = meta.data[i + 1];
-      const raw0 = data[i];
-      const raw1 = data[i + 1];
-      const isError =
-        (raw0 && raw0.condensation_error) || (raw1 && raw1.condensation_error);
-      ctx.beginPath();
-      ctx.moveTo(p0.x, p0.y);
-      ctx.lineTo(p1.x, p1.y);
-      ctx.lineTo(p1.x, y0);
-      ctx.lineTo(p0.x, y0);
-      ctx.closePath();
-      ctx.fillStyle = isError ? "rgba(220, 38, 38, 0.25)" : "rgba(79, 70, 229, 0.25)";
-      ctx.fill();
-    }
-    ctx.restore();
-  },
-};
-if (typeof Chart !== "undefined") Chart.register(historyLevelFillPlugin);
-
 function renderChart(readings) {
-  const dataPercent = readings.map((r) => ({
-    x: new Date(r.ts).getTime(),
-    y: r.level_percent,
-    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
-  }));
-  const dataDistance = readings.map((r) => ({
-    x: new Date(r.ts).getTime(),
-    y: r.distance_cm,
-    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
-  }));
-
+  const data = readings.map((r) => ({ x: new Date(r.ts).getTime(), y: r.level_percent }));
   const ctx = document.getElementById("historyChart").getContext("2d");
-  const window = getRangeWindow(currentRange);
-  const timeUnit = getTimeUnit(window);
+  const b = currentBlock || {};
   return new Chart(ctx, {
     type: "line",
     data: {
       datasets: [
         {
-          label: "Level (%)",
-          data: dataPercent,
-          borderColor: "#4f46e5",
-          tension: 0.2,
+          label: "Level",
+          data,
+          borderColor: "#0ea5e9",
+          backgroundColor: "rgba(14,165,233,0.12)",
+          borderWidth: 2.5,
+          tension: 0.35,
+          cubicInterpolationMode: "monotone",
           spanGaps: true,
-          yAxisID: "yPercent",
-          fill: false,
-          pointRadius: (ctx) => (ctx.raw?.condensation_error ? 4 : 0),
-          pointBackgroundColor: (ctx) =>
-            ctx.raw?.condensation_error ? "#dc2626" : "#4f46e5",
-          pointBorderColor: (ctx) =>
-            ctx.raw?.condensation_error ? "#b91c1c" : "#4f46e5",
-          pointBorderWidth: 1,
-        },
-        {
-          label: "Distance (cm)",
-          data: dataDistance,
-          borderColor: "#16a34a",
-          backgroundColor: "rgba(22, 163, 74, 0.2)",
-          tension: 0.2,
-          spanGaps: true,
-          yAxisID: "yDistance",
-          hidden: true, // Hidden by default
-          pointRadius: (ctx) => (ctx.raw?.condensation_error ? 4 : 0),
-          pointBackgroundColor: (ctx) =>
-            ctx.raw?.condensation_error ? "#dc2626" : "#16a34a",
-          pointBorderColor: (ctx) =>
-            ctx.raw?.condensation_error ? "#b91c1c" : "#16a34a",
-          pointBorderWidth: 1,
+          fill: "origin",
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          pointHoverBackgroundColor: "#0ea5e9",
         },
       ],
     },
@@ -453,51 +398,33 @@ function renderChart(readings) {
       maintainAspectRatio: false,
       interaction: { mode: "index", intersect: false },
       plugins: {
-        legend: {
-          display: true,
-          onClick: (e, legendItem, legend) => {
-            // Allow toggling datasets via legend clicks
-            const index = legendItem.datasetIndex;
-            const chart = legend.chart;
-            const meta = chart.getDatasetMeta(index);
-            meta.hidden = meta.hidden === null ? !chart.data.datasets[index].hidden : null;
-            chart.update();
-          },
+        legend: { display: false },
+        tooltip: {
+          displayColors: false,
+          callbacks: { label: (c) => (c.parsed.y == null ? "–" : `${c.parsed.y.toFixed(0)}% full`) },
         },
       },
       scales: {
         x: {
           type: "time",
           time: {
-            unit: timeUnit,
+            unit: b.unit || "day",
             tooltipFormat: "PPpp",
-            displayFormats: {
-              hour: "ha",
-              day: "MMM d",
-              week: "MMM d",
-              month: "MMM yyyy",
-              year: "yyyy",
-            },
+            displayFormats: { hour: "ha", day: "d MMM", week: "d MMM", month: "MMM yyyy", year: "yyyy" },
           },
-          min: window ? window.min : undefined,
-          max: window ? window.max : undefined,
-          title: { display: true, text: "Time" },
+          min: b.min ?? undefined,
+          max: b.max ?? undefined,
+          grid: { display: false },
+          border: { display: false },
+          ticks: { maxRotation: 0, autoSkipPadding: 20, color: "#94a3b8" },
         },
-        yPercent: {
+        y: {
           type: "linear",
-          position: "left",
           min: 0,
           max: 100,
-          title: { display: true, text: "Level (%)" },
-        },
-        yDistance: {
-          type: "linear",
-          position: "right",
-          min: 0,
-          // Just past SENSOR_TO_BOTTOM_CM (267) so the empty tank fits.
-          max: 300,
-          title: { display: true, text: "Distance (cm)" },
-          grid: { drawOnChartArea: false },
+          grid: { color: "rgba(15,23,42,0.06)" },
+          border: { display: false },
+          ticks: { stepSize: 25, callback: (v) => `${v}%`, color: "#94a3b8" },
         },
       },
     },
@@ -505,61 +432,14 @@ function renderChart(readings) {
 }
 
 function updateChart(chart, readings) {
-  const dataPercent = readings.map((r) => ({
-    x: new Date(r.ts).getTime(),
-    y: r.level_percent,
-    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
-  }));
-  const dataDistance = readings.map((r) => ({
-    x: new Date(r.ts).getTime(),
-    y: r.distance_cm,
-    condensation_error: r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm,
-  }));
-  const window = getRangeWindow(currentRange);
-  const timeUnit = getTimeUnit(window);
-  chart.data.datasets[0].data = dataPercent;
-  chart.data.datasets[1].data = dataDistance;
-  // Preserve the hidden state from legend clicks (meta.hidden can be true, false, or null)
-  const distanceMeta = chart.getDatasetMeta(1);
-  if (distanceMeta && chart.data.datasets[1]) {
-    chart.data.datasets[1].hidden = distanceMeta.hidden !== false;
-  }
-  chart.options.scales.x.min = window ? window.min : undefined;
-  chart.options.scales.x.max = window ? window.max : undefined;
-  chart.options.scales.x.time.unit = timeUnit;
-  chart.options.scales.x.time.displayFormats.hour = "ha";
+  const data = readings.map((r) => ({ x: new Date(r.ts).getTime(), y: r.level_percent }));
+  const b = currentBlock || {};
+  chart.data.datasets[0].data = data;
+  chart.options.scales.x.min = b.min ?? undefined;
+  chart.options.scales.x.max = b.max ?? undefined;
+  chart.options.scales.x.time.unit = b.unit || "day";
   chart.update();
 }
-
-const feedinFullLabelPlugin = {
-  id: "feedinFullLabel",
-  afterDatasetsDraw(chart) {
-    if (chart.canvas.id !== "feedinChart") return;
-    const ds = chart.data.datasets[0];
-    if (!ds || !ds.data.length) return;
-    const meta = chart.getDatasetMeta(0);
-    const ctx = chart.ctx;
-    meta.data.forEach((point, i) => {
-      const raw = ds.data[i];
-      if (!raw || point.skip === true) return;
-      const isError = raw.condensation_error;
-      const isFull = raw.reached_full && !isError;
-      if (!isError && !isFull) return;
-      const x = point.x;
-      const y = point.y - 22;
-      ctx.save();
-      ctx.translate(x, y);
-      ctx.rotate(-Math.PI / 2);
-      ctx.font = "bold 11px sans-serif";
-      ctx.fillStyle = isError ? "#dc2626" : "#22c55e";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(isError ? "error" : "full", 0, 0);
-      ctx.restore();
-    });
-  },
-};
-if (typeof Chart !== "undefined") Chart.register(feedinFullLabelPlugin);
 
 function renderFeedinChart(dailyRates, feedinRate) {
   const ctx = document.getElementById("feedinChart").getContext("2d");
@@ -613,36 +493,17 @@ function renderFeedinChart(dailyRates, feedinRate) {
 
   const datasets = [
     {
-      label: "Feed-in Rate (L/hour)",
+      label: "Feed-in",
       data: data,
-      borderColor: "#3b82f6",
-      segment: {
-        borderColor: (ctx) => {
-          const p0 = ctx.p0?.raw;
-          const p1 = ctx.p1?.raw;
-          if (p0?.condensation_error && p1?.condensation_error) return "#dc2626";
-          if (p0?.reached_full && p1?.reached_full) return "#22c55e";
-          return "#3b82f6";
-        },
-      },
-      backgroundColor: "rgba(59, 130, 246, 0.2)",
-      borderWidth: 2,
-      tension: 0.2,
-      fill: true,
-      pointRadius: 4,
-      pointBackgroundColor: (ctx) =>
-        ctx.raw?.condensation_error
-          ? "#dc2626"
-          : ctx.raw?.reached_full
-            ? "#22c55e"
-            : "#3b82f6",
-      pointBorderColor: (ctx) =>
-        ctx.raw?.condensation_error
-          ? "#b91c1c"
-          : ctx.raw?.reached_full
-            ? "#16a34a"
-            : "#2563eb",
-      pointBorderWidth: 1,
+      borderColor: "#0d9488",
+      backgroundColor: "rgba(13,148,136,0.12)",
+      borderWidth: 2.5,
+      tension: 0.35,
+      cubicInterpolationMode: "monotone",
+      fill: "origin",
+      pointRadius: 0,
+      pointHoverRadius: 4,
+      pointHoverBackgroundColor: "#0d9488",
     },
   ];
 
@@ -652,11 +513,11 @@ function renderFeedinChart(dailyRates, feedinRate) {
     const xMax = new Date(dailyRates[dailyRates.length - 1].date + "T00:00:00").getTime();
     datasets.push({
       type: "line",
-      label: `7-day average: ${numFeedinRate.toFixed(1)} L/hour`,
+      label: `avg ${numFeedinRate.toFixed(0)} L/h`,
       data: [{ x: xMin, y: numFeedinRate }, { x: xMax, y: numFeedinRate }],
-      borderColor: "#2563eb",
-      borderWidth: 2,
-      borderDash: [6, 4],
+      borderColor: "#94a3b8",
+      borderWidth: 1.5,
+      borderDash: [5, 4],
       pointRadius: 0,
       fill: false,
     });
@@ -672,52 +533,25 @@ function renderFeedinChart(dailyRates, feedinRate) {
       scales: {
         x: {
           type: "time",
-          time: {
-            unit: "day",
-            tooltipFormat: "PP",
-            displayFormats: {
-              day: "MMM d",
-            },
-          },
-          title: { display: true, text: "Date" },
+          time: { unit: "day", tooltipFormat: "PP", displayFormats: { day: "d MMM" } },
+          grid: { display: false },
+          border: { display: false },
+          ticks: { maxRotation: 0, autoSkipPadding: 20, color: "#94a3b8" },
         },
         y: {
-          title: { display: true, text: "Flow Rate (L/hour)" },
           beginAtZero: true,
-          suggestedMax: !isNaN(numFeedinRate) && numFeedinRate > 0
-            ? Math.max(10, numFeedinRate * 1.2)
-            : undefined,
+          grid: { color: "rgba(15,23,42,0.06)" },
+          border: { display: false },
+          ticks: { color: "#94a3b8" },
+          suggestedMax: !isNaN(numFeedinRate) && numFeedinRate > 0 ? Math.max(10, numFeedinRate * 1.2) : undefined,
         },
       },
       plugins: {
-        legend: {
-          display: true,
-        },
+        legend: { display: false },
         tooltip: {
+          displayColors: false,
           callbacks: {
-            label: function (context) {
-              const rate = context.parsed.y;
-              if (context.dataset.label && context.dataset.label.startsWith("7-day average")) {
-                return `${context.dataset.label}`;
-              }
-              const dailyRatesEntry = dailyRates.find(
-                (r) => new Date(r.date + "T00:00:00").getTime() === context.parsed.x
-              );
-              if (dailyRatesEntry) {
-                const lines = [
-                  `Flow Rate: ${rate.toFixed(1)} L/hour`,
-                  `Level: ${dailyRatesEntry.level_start.toFixed(1)}% → ${dailyRatesEntry.level_end.toFixed(1)}%`,
-                ];
-                if (dailyRatesEntry.condensation_error) {
-                  lines.push("Sensor error (condensation, <13cm)");
-                }
-                if (dailyRatesEntry.reached_full) {
-                  lines.push("Tank reached 100% during this window");
-                }
-                return lines;
-              }
-              return `Flow Rate: ${rate.toFixed(1)} L/hour`;
-            },
+            label: (c) => (c.dataset.label && c.dataset.label.startsWith("avg")) ? c.dataset.label : `${c.parsed.y.toFixed(0)} L/h`,
           },
         },
       },
@@ -741,40 +575,16 @@ function updateFeedinChart(chart, dailyRates, feedinRate) {
   }));
 
   chart.data.datasets[0].data = data;
-  chart.data.datasets[0].pointBackgroundColor = (ctx) =>
-    ctx.raw?.condensation_error
-      ? "#dc2626"
-      : ctx.raw?.reached_full
-        ? "#22c55e"
-        : "#3b82f6";
-  chart.data.datasets[0].pointBorderColor = (ctx) =>
-    ctx.raw?.condensation_error
-      ? "#b91c1c"
-      : ctx.raw?.reached_full
-        ? "#16a34a"
-        : "#2563eb";
-  chart.data.datasets[0].segment = {
-    borderColor: (ctx) => {
-      const p0 = ctx.p0?.raw;
-      const p1 = ctx.p1?.raw;
-      if (p0?.condensation_error && p1?.condensation_error) return "#dc2626";
-      if (p0?.reached_full && p1?.reached_full) return "#22c55e";
-      return "#3b82f6";
-    },
-  };
-
+  const numFeedinRate = feedinRate != null ? Number(feedinRate) : NaN;
   const xMin = new Date(dailyRates[0].date + "T00:00:00").getTime();
   const xMax = new Date(dailyRates[dailyRates.length - 1].date + "T00:00:00").getTime();
-  const numFeedinRate = feedinRate != null ? Number(feedinRate) : NaN;
   if (chart.options.scales && chart.options.scales.y) {
     chart.options.scales.y.suggestedMax =
-      !isNaN(numFeedinRate) && numFeedinRate > 0
-        ? Math.max(10, numFeedinRate * 1.2)
-        : undefined;
+      !isNaN(numFeedinRate) && numFeedinRate > 0 ? Math.max(10, numFeedinRate * 1.2) : undefined;
   }
   if (!isNaN(numFeedinRate)) {
-    const avgLabel = `7-day average: ${numFeedinRate.toFixed(1)} L/hour`;
-    const avgLine = chart.data.datasets.find((d) => d.label && d.label.startsWith("7-day average"));
+    const avgLabel = `avg ${numFeedinRate.toFixed(0)} L/h`;
+    const avgLine = chart.data.datasets.find((d) => d.label && d.label.startsWith("avg"));
     const lineData = [{ x: xMin, y: numFeedinRate }, { x: xMax, y: numFeedinRate }];
     if (avgLine) {
       avgLine.data = lineData;
@@ -784,9 +594,9 @@ function updateFeedinChart(chart, dailyRates, feedinRate) {
         type: "line",
         label: avgLabel,
         data: lineData,
-        borderColor: "#2563eb",
-        borderWidth: 2,
-        borderDash: [6, 4],
+        borderColor: "#94a3b8",
+        borderWidth: 1.5,
+        borderDash: [5, 4],
         pointRadius: 0,
         fill: false,
       });
@@ -794,7 +604,6 @@ function updateFeedinChart(chart, dailyRates, feedinRate) {
   } else if (chart.data.datasets.length > 1) {
     chart.data.datasets.pop();
   }
-
   chart.update();
 }
 
@@ -861,14 +670,11 @@ function renderFirmware(status) {
 }
 
 async function updateDashboard() {
-  // Pass since= so /api/readings returns only what the chart needs, instead of
-  // dragging ALL readings every minute. 'All time' (window=null) falls through
-  // to the server's limit cap.
-  const window = getRangeWindow(currentRange);
-  const since = window ? window.min : null;
+  currentBlock = computeBlock(currentRange);
+  renderRangeControls(currentBlock);
   const [latest, readings, feedinRate, dailyRates, usageAnalysis, bookings, firmware] = await Promise.all([
     fetchLatest(),
-    fetchReadings(since),
+    fetchReadings(currentBlock.min, currentBlock.max, currentBlock.bucket),
     fetchFeedinRate(),
     fetchDailyFeedinRates(),
     fetchUsageAnalysis(),
@@ -885,14 +691,6 @@ async function updateDashboard() {
         ? null
         : latest.reading;
   updateDaysRemaining(displayReading, usageAnalysis);
-  const hasHistoryError = readings.some(
-    (r) => r.distance_cm != null && r.distance_cm < serverConfig.condensation_error_cm
-  );
-  const hasFeedinError = (dailyRates || []).some((r) => r.condensation_error);
-  const historyLegendEl = document.getElementById("history-legend");
-  const feedinLegendEl = document.getElementById("feedin-legend");
-  if (historyLegendEl) historyLegendEl.style.display = hasHistoryError ? "block" : "none";
-  if (feedinLegendEl) feedinLegendEl.style.display = hasFeedinError ? "block" : "none";
   const historyEmptyEl = document.getElementById("history-empty");
   if (historyEmptyEl) historyEmptyEl.style.display = readings.length === 0 ? "block" : "none";
   if (!historyChart) {
@@ -908,52 +706,36 @@ async function updateDashboard() {
 }
 
 async function init() {
-  const savedRange = localStorage.getItem("tankRange");
-  if (savedRange) {
-    try {
-      currentRange = JSON.parse(savedRange);
-    } catch (err) {
-      currentRange = { type: "preset", value: "1w" };
-    }
-  }
-  setActiveRangeButton(currentRange);
-  document.querySelectorAll(".range-btn").forEach((btn) => {
+  try {
+    const saved = JSON.parse(localStorage.getItem("tankRange2"));
+    if (saved && saved.type) currentRange = { type: saved.type, offset: saved.offset || 0 };
+  } catch (err) {}
+  document.querySelectorAll("#range-pills button").forEach((btn) => {
     btn.addEventListener("click", () => {
-      currentRange = { type: "preset", value: btn.dataset.range };
-      setActiveRangeButton(currentRange);
-      localStorage.setItem("tankRange", JSON.stringify(currentRange));
+      currentRange = { type: btn.dataset.range, offset: 0 };
+      saveRange();
       updateDashboard();
     });
   });
-  document.getElementById("preset-range-select").addEventListener("change", (event) => {
-    currentRange = { type: "preset", value: event.target.value };
-    setActiveRangeButton(currentRange);
-    localStorage.setItem("tankRange", JSON.stringify(currentRange));
+  const prevBtn = document.getElementById("range-prev");
+  const nextBtn = document.getElementById("range-next");
+  if (prevBtn) prevBtn.addEventListener("click", () => {
+    currentRange.offset = (currentRange.offset || 0) + 1;
+    saveRange();
     updateDashboard();
   });
-  const applyCustomRange = () => {
-    const value = parseInt(document.getElementById("custom-range-value").value, 10);
-    const unit = document.getElementById("custom-range-unit").value;
-    if (!Number.isFinite(value) || value <= 0) {
-      return;
-    }
-    currentRange = { type: "custom", value, unit };
-    setActiveRangeButton(currentRange);
-    localStorage.setItem("tankRange", JSON.stringify(currentRange));
+  if (nextBtn) nextBtn.addEventListener("click", () => {
+    currentRange.offset = Math.max(0, (currentRange.offset || 0) - 1);
+    saveRange();
     updateDashboard();
-  };
-  document.getElementById("custom-range-apply").addEventListener("click", applyCustomRange);
-  document.getElementById("custom-range-unit").addEventListener("change", applyCustomRange);
-  document.getElementById("custom-range-value").addEventListener("keyup", (event) => {
-    if (event.key === "Enter") {
-      applyCustomRange();
-    }
   });
 
   // Fetch server config first so charts + level math use authoritative constants.
   await fetchConfig();
   await updateDashboard();
-  setInterval(updateDashboard, REFRESH_INTERVAL_MS);
+  // Only auto-refresh when viewing the current block, so a background refresh
+  // doesn't yank you out of a historical view mid-browse.
+  setInterval(() => { if ((currentRange.offset || 0) === 0) updateDashboard(); }, REFRESH_INTERVAL_MS);
 }
 
 init();
