@@ -805,6 +805,29 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/sw.js")
+def service_worker() -> FileResponse:
+    """Serve the service worker from the root so its scope covers the whole
+    origin (a SW served from /static/ could only control /static/)."""
+    path = WEB_DIR / "sw.js"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="sw.js not found")
+    return FileResponse(
+        path,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+    )
+
+
+@app.get("/manifest.webmanifest")
+def web_manifest() -> FileResponse:
+    """Serve the PWA manifest with the correct content-type at the root."""
+    path = WEB_DIR / "manifest.webmanifest"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="manifest not found")
+    return FileResponse(path, media_type="application/manifest+json")
+
+
 @app.post("/api/readings")
 def create_reading(reading: ReadingIn) -> dict:
     if INGEST_API_KEY and reading.api_key != INGEST_API_KEY:

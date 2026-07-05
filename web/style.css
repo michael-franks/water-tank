@@ -11,6 +11,21 @@ body {
   padding: 24px;
 }
 
+/* Offline / network banner */
+.net-banner {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  text-align: center;
+}
+.net-banner[hidden] {
+  display: none;
+}
+
 /* Tab navigation */
 .tab-nav {
   display: flex;

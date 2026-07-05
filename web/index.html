@@ -2,15 +2,25 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Water Tank Monitor</title>
-    <link rel="icon" type="image/png" href="/static/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Bach Water Tank</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/icons/favicon-16.png" />
     <link rel="stylesheet" href="/static/style.css" />
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0"></script>
+    <!-- PWA: installable standalone app, offline shell, iOS home-screen support -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#0ea5e9" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Bach Tank" />
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon-180.png" />
+    <script src="/static/vendor/chart.umd.min.js"></script>
+    <script src="/static/vendor/chartjs-adapter-date-fns.bundle.min.js"></script>
   </head>
   <body>
     <div class="container">
+      <div id="net-banner" class="net-banner" hidden></div>
       <nav class="tab-nav" role="tablist">
         <button class="tab-btn active" data-tab="dashboard" role="tab" aria-selected="true">Dashboard</button>
         <button class="tab-btn" data-tab="calendar" role="tab" aria-selected="false">Calendar</button>

@@ -1130,6 +1130,28 @@ document.getElementById("cal-today")?.addEventListener("click", goToToday);
 setupTabs();
 
 // -----------------------------------------------------------------------------
+// PWA: register the service worker + a lightweight offline banner.
+// -----------------------------------------------------------------------------
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch((e) => console.warn("SW registration failed", e));
+}
+(function offlineBanner() {
+  const el = document.getElementById("net-banner");
+  if (!el) return;
+  const sync = () => {
+    if (navigator.onLine) {
+      el.hidden = true;
+    } else {
+      el.textContent = "Offline — showing last-known data";
+      el.hidden = false;
+    }
+  };
+  window.addEventListener("online", sync);
+  window.addEventListener("offline", sync);
+  sync();
+})();
+
+// -----------------------------------------------------------------------------
 // Notification preferences — fetch on load, POST on toggle, optimistic update
 // with rollback on failure.
 // -----------------------------------------------------------------------------
