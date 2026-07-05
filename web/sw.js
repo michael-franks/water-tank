@@ -2,7 +2,7 @@
    Bump CACHE / API_CACHE when the shell asset list changes to force a refresh.
    Mirrors the Crumb PWA's service worker, plus API response caching so an
    offline open still shows the last-known tank state. */
-const CACHE = 'watertank-shell-v2';
+const CACHE = 'watertank-shell-v3';
 const API_CACHE = 'watertank-api-v1';
 const SHELL = [
   '/',

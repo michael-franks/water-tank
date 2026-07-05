@@ -1,6 +1,6 @@
 // Generates the Water Tank PWA icon set as flat-art PNGs with zero npm deps:
 // per-pixel rasterization + manual PNG chunk assembly (zlib deflate, CRC32).
-// A white water droplet on a cyan field. Usage: node tools/gen-icons.js
+// A filled water tank with a wavy surface. Usage: node tools/gen-icons.js
 // (writes into web/icons/). Adapted from the Crumb PWA's generator so the
 // two apps share the same icon pipeline.
 const fs = require('fs');
@@ -58,12 +58,13 @@ function encodePng(width, height, pixels) {
   ]);
 }
 
-/* ── Flat water-drop art ── */
+/* ── Flat water-tank art ── */
 
-const BG     = [0x0e, 0xa5, 0xe9, 255]; // cyan-500 field (#0ea5e9)
-const DROP   = [0xff, 0xff, 0xff, 255]; // white droplet
-const HILITE = [0xba, 0xe6, 0xfd, 255]; // sky-200 highlight on the droplet
-const CLEAR  = [0, 0, 0, 0];
+const BG      = [0xe0, 0xf2, 0xfe, 255]; // pale sky field (#e0f2fe)
+const OUTLINE = [0x03, 0x69, 0xa1, 255]; // dark-cyan tank wall (#0369a1)
+const WATER   = [0x0e, 0xa5, 0xe9, 255]; // cyan water (#0ea5e9)
+const AIR     = [0xff, 0xff, 0xff, 255]; // white space above the waterline
+const CLEAR   = [0, 0, 0, 0];
 
 // One point sample. opts: cornerRadius (fraction of S, 0 = square bg),
 // artScale (1 = normal, 0.6 = maskable safe zone).
@@ -76,29 +77,23 @@ function sample(x, y, S, opts) {
   }
   const k = opts.artScale;
   const cx = S / 2;
-  // Teardrop as ONE smooth shape: a round bulb whose sides are the tangent lines
-  // from the apex to the circle. Using the tangent points (not the circle's
-  // equator) means the straight sides meet the arc slope-continuously — no kink,
-  // no "two shapes" look. Region = bulb disk ∪ triangle(apex, tangentL, tangentR).
-  const cy = S * 0.5 + S * 0.08 * k;    // bulb centre, a touch below middle
-  const r = S * 0.26 * k;               // bulb radius
-  const apexY = cy - S * 0.46 * k;      // pointed top
-  const d = cy - apexY;                 // apex-to-centre distance (must exceed r)
-  const root = Math.sqrt(Math.max(d * d - r * r, 0));
-  const tangentY = cy - (r * r) / d;    // y of the two tangent points
-  const tangentHalfW = (r * root) / d;  // half-width of the shape there
-  const inBulb = (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r;
-  let inCone = false;
-  if (y >= apexY && y <= tangentY) {
-    const halfW = tangentHalfW * (y - apexY) / (tangentY - apexY);
-    inCone = Math.abs(x - cx) <= halfW;
-  }
-  if (inBulb || inCone) {
-    const hx = cx - r * 0.34, hy = cy - r * 0.30, hr = r * 0.30;
-    if (((x - hx) * (x - hx) + (y - hy) * (y - hy)) <= hr * hr) return HILITE;
-    return DROP;
-  }
-  return BG;
+  const cy = S * 0.52;
+  // Water tank: a rounded-rect body (taller than wide) with a bold wall and a
+  // wavy waterline. Uses a rounded-rect signed-distance field — dist<0 inside,
+  // and the wall is the band |dist| <= sw/2 straddling the edge.
+  const hx = S * 0.22 * k;   // half width
+  const hy = S * 0.30 * k;   // half height
+  const rr = S * 0.06 * k;   // corner radius
+  const sw = S * 0.05 * k;   // wall thickness
+  const qx = Math.abs(x - cx) - (hx - rr);
+  const qy = Math.abs(y - cy) - (hy - rr);
+  const ax = Math.max(qx, 0), ay = Math.max(qy, 0);
+  const dist = Math.sqrt(ax * ax + ay * ay) + Math.min(Math.max(qx, qy), 0) - rr;
+  if (dist > sw / 2) return BG;          // outside the tank
+  if (dist > -sw / 2) return OUTLINE;    // the tank wall
+  const waterBase = cy - hy * 0.18;      // ~59% full
+  const waterY = waterBase + S * 0.018 * k * Math.sin((x - cx) / (S * 0.05 * k));
+  return y >= waterY ? WATER : AIR;      // water below the wavy surface, air above
 }
 
 // 3x3 supersampling with premultiplied-alpha averaging (clean rounded corners).
