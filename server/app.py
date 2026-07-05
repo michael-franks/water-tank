@@ -109,6 +109,15 @@ VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
 VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
 
+# Email — secondary alert channel alongside push (belt-and-braces). Comma-separated
+# recipients; disabled if the SMTP settings are unset. send_email() is best-effort.
+ALERT_EMAIL_TO = [e.strip() for e in os.getenv("ALERT_EMAIL_TO", "").split(",") if e.strip()]
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip()
+
 
 class ReadingIn(BaseModel):
     device_id: str = Field(default=DEFAULT_DEVICE_ID, min_length=1)
@@ -325,10 +334,34 @@ def remove_push_subscription(endpoint: str) -> None:
     conn.close()
 
 
+def send_email(subject: str, body: str) -> None:
+    """Best-effort SMTP email. Swallows its own errors — a mail failure must not
+    break reading ingestion or the push path."""
+    if not (ALERT_EMAIL_TO and SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM):
+        return
+    import smtplib
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = SMTP_FROM
+    msg["To"] = ", ".join(ALERT_EMAIL_TO)
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg, to_addrs=ALERT_EMAIL_TO)
+    except Exception:
+        pass
+
+
 def notify(title: str, body: str, url: str = "/", tag: str = "watertank") -> int:
-    """Send a web push to every stored subscription. Prunes dead (404/410) subs.
-    No-op (returns 0) if push isn't configured. Never raises to callers — a
-    notification failure must not break reading ingestion."""
+    """Deliver an alert via web push (all subscriptions) AND email (best-effort).
+    Push is the primary channel; email is the belt-and-braces fallback. Each is
+    independent. Prunes dead (404/410) subs. Never raises — a notification
+    failure must not break ingestion. Returns push subscriptions delivered to."""
+    send_email(title, body)  # secondary channel; swallows its own errors
     if not _push_configured():
         return 0
     conn = get_db()
