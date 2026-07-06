@@ -564,9 +564,14 @@ header {
   margin-bottom: 0;
 }
 
-.chart-section canvas {
-  width: 100% !important;
-  height: 360px !important;
+/* Fixed-height wrapper + no forced canvas size lets Chart.js manage the
+   device-pixel-ratio backing store, so axis text renders crisp and unstretched. */
+.chart-box {
+  position: relative;
+  height: 340px;
+}
+.chart-box canvas {
+  display: block;
 }
 
 .chart-section h2 {
@@ -712,8 +717,8 @@ header {
     width: 100%;
   }
 
-  .chart-section canvas {
-    height: 420px !important;
+  .chart-box {
+    height: 300px;
   }
 
   /* Calendar gets tighter on mobile */

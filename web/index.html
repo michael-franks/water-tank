@@ -73,14 +73,14 @@
             <button type="button" id="range-next" class="range-step" aria-label="Next period">›</button>
           </div>
         </div>
-        <canvas id="historyChart"></canvas>
+        <div class="chart-box"><canvas id="historyChart"></canvas></div>
         <p id="history-empty" class="chart-empty" style="display: none;">No readings in this period — the sensor may have been offline. Try a wider range or step back with ‹.</p>
       </section>
 
       <section class="chart-section">
         <h2>Feed-in Rate</h2>
         <p class="feedin-rate-subtitle">Average feed-in rate (measured from 2-7am)</p>
-        <canvas id="feedinChart"></canvas>
+        <div class="chart-box"><canvas id="feedinChart"></canvas></div>
         <p id="feedin-legend" class="feedin-legend muted" style="display: none;">🔴= sensor error (condensation)</p>
       </section>
 
