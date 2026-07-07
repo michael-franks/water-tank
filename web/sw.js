@@ -2,7 +2,7 @@
    Bump CACHE / API_CACHE when the shell asset list changes to force a refresh.
    Mirrors the Crumb PWA's service worker, plus API response caching so an
    offline open still shows the last-known tank state. */
-const CACHE = 'watertank-shell-v4';
+const CACHE = 'watertank-shell-v5';
 const API_CACHE = 'watertank-api-v1';
 const SHELL = [
   '/',
@@ -50,7 +50,12 @@ self.addEventListener('fetch', (e) => {
   // (or between-readings) open still shows the last-known tank state.
   if (url.pathname.startsWith('/api/')) {
     e.respondWith(
-      fetch(req).then((res) => {
+      // redirect:'manual' so an expired Cloudflare Access session surfaces as an
+      // opaqueredirect the page can detect (and prompt re-login) rather than being
+      // silently masked as stale cached JSON. The page's fetch uses redirect:'manual'
+      // too, so it may receive the opaqueredirect response.
+      fetch(req, { redirect: 'manual' }).then((res) => {
+        if (res.type === 'opaqueredirect') return res;
         const ct = res.headers.get('content-type') || '';
         if (cacheable(res) && ct.includes('application/json')) {
           const copy = res.clone();

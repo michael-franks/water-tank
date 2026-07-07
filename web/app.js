@@ -1,3 +1,45 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Cloudflare Access re-login handling.
+// When the Access session expires, protected requests get a 302 to the CF login
+// (cross-origin), which makes a normal fetch throw "Load failed". Shim fetch to
+// use redirect:'manual' so that bounce surfaces as an opaqueredirect we can
+// detect, and show a "session expired — tap to sign in" banner instead. A bare
+// reload is served from the SW cache, so the re-login navigation busts it with a
+// one-shot query string to force a network hit that re-triggers Access.
+(function cfAccessReauth() {
+  let shown = false;
+  window.showReauth = function () {
+    if (shown) return;
+    shown = true;
+    const b = document.createElement("div");
+    b.setAttribute("role", "button");
+    b.tabIndex = 0;
+    b.textContent = "Session expired — tap to sign in again";
+    b.style.cssText =
+      "position:fixed;left:0;right:0;bottom:0;z-index:99999;background:#b3261e;" +
+      "color:#fff;padding:15px 16px;text-align:center;cursor:pointer;" +
+      "font:600 15px/1.35 system-ui,-apple-system,sans-serif;box-shadow:0 -2px 14px rgba(0,0,0,.35)";
+    const go = () => location.assign("/?reauth=" + Date.now());
+    b.addEventListener("click", go);
+    b.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
+    });
+    document.body.appendChild(b);
+  };
+  const orig = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    init = init || {};
+    if (init.redirect === undefined) init.redirect = "manual";
+    return orig(input, init).then((res) => {
+      if (res && res.type === "opaqueredirect") {
+        window.showReauth();
+        throw new Error("Session expired");
+      }
+      return res;
+    });
+  };
+})();
+
 const lastUpdateEl = document.getElementById("last-update");
 const lastUpdateMetaEl = document.getElementById("last-update-meta");
 const signalDetailsEl = document.getElementById("signal-details");
