@@ -2,7 +2,8 @@
 
 Personal monitor for the bach's rainwater tank. A cellular IoT sensor in the
 tank reports level + RSRP every 30 min over LTE-M; the server stores readings
-in SQLite, drives the dashboard, and (when enabled) sends email alerts.
+in SQLite, drives the dashboard (an installable PWA), and (when enabled) sends
+web-push + email alerts.
 
 Live at **https://bach.franks.nz** (behind Cloudflare Access) and
 **https://ingest-bach.franks.nz** (unauthenticated — sensor POSTs here),
@@ -110,3 +111,43 @@ never in git. Two layers protect it:
 The post-receive deploy hook keeps `server/data/` and `server/.env` untouched
 across deploys (they get stashed/restored), and a `.deploybak/code.tar.gz`
 snapshot of the previous server+web code is taken before every promote.
+
+## Status & roadmap
+
+**Built (as of 2026-07):** installable PWA (add-to-home-screen, offline app
+shell + last-known data), **web-push and email** alerts, a Calendar tab synced
+from the VRBO/Bookabach iCal feed, occupancy detection, a minimal History graph
+with time-block navigation (Day/Week/Month/Year/All + `‹ ›` stepper) and
+server-side downsampling, a restyled Feed-in graph, and a self-hosted OTA
+firmware backend. LXC 104 is in the weekly Proxmox backup.
+
+### Next steps
+
+1. **Sensor swap — ultrasonic → RS485 hydrostatic (highest value).**
+   The ultrasonic sensor throws condensation false-readings and has been offline
+   since 2026-06-20. Replace it with a submersible RS485/Modbus hydrostatic
+   transmitter (spec'd: QDY30A-B, 5 m range / 10 m cable) wired to the hat's
+   METER RS485 port (J7 → nRF9160 P0.10/DE, P0.11/TX, P0.12/RX). Submerged, so
+   condensation is physically impossible. To do: order it, get the Modbus
+   register map from the seller, write a Zephyr Modbus RTU client.
+
+2. **OTA firmware — finish the device side.**
+   The self-hosted FOTA server is built and live (`/api/firmware/*`, resumable
+   downloads, dead-subscription pruning). Remaining, on the **spare nRF9160** at
+   the desk: add MCUboot + the anti-brick loop (test-and-confirm + watchdog +
+   auto-rollback) and prove it by pushing a deliberately-broken image and
+   watching it revert; then fold in the RS485 firmware. One bach visit
+   USB-flashes the combined image — after that, all firmware updates are OTA.
+
+3. **iPhone push — install + enable (on-device, Michael only).**
+   Add bach.franks.nz to the iPhone home screen, open the installed app, tap
+   "Enable alerts", then Test. iOS only delivers web push to an installed PWA
+   (16.4+). Email is the fallback until this is confirmed.
+
+### Smaller / when convenient
+- `temp_c` is always null — the firmware never reads/sends temperature.
+- LTE signal is weak (RSRP −112…−121 dBm) — check antenna placement during the
+  sensor visit.
+- The old `watertank` (no-hyphen) GitHub repo is orphaned — delete it if unwanted.
+- The device is currently offline (last reading 2026-06-20), so the default
+  Month view looks empty until it reports again — step back with `‹` to see June.
